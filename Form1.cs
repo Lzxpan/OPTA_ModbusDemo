@@ -259,9 +259,9 @@ namespace OPTA_ModbusDemo
                     return sb.ToString().Trim();
                 }
 
-                if (TryParseChannel(p[2], out var ch, 8))
+                if (TryParseChannel(p[2], out var readCh, 8))
                 {
-                    return $"CH{ch}: raw={_aiRaw[ch]}, type=0x{_aiType[ch]:X4}, value={FormatAiValue(ch)}";
+                    return $"CH{readCh}: raw={_aiRaw[readCh]}, type=0x{_aiType[readCh]:X4}, value={FormatAiValue(readCh)}";
                 }
                 return "ERR AI4 channel";
             }
@@ -275,11 +275,11 @@ namespace OPTA_ModbusDemo
                     return $"OK AI4 TYPE=0x{type:X4}";
                 }
 
-                if (p.Length >= 5 && TryParseChannel(p[2], out var ch, 8) && p[3].Equals("TYPE", StringComparison.OrdinalIgnoreCase))
+                if (p.Length >= 5 && TryParseChannel(p[2], out var setCh, 8) && p[3].Equals("TYPE", StringComparison.OrdinalIgnoreCase))
                 {
                     if (!TryParseType(p[4], out var type)) return "ERR TYPE format";
-                    _aiType[ch] = type;
-                    return $"OK AI4 CH{ch} TYPE=0x{type:X4}";
+                    _aiType[setCh] = type;
+                    return $"OK AI4 CH{setCh} TYPE=0x{type:X4}";
                 }
             }
 
@@ -290,17 +290,17 @@ namespace OPTA_ModbusDemo
         {
             if (action == "READ")
             {
-                if (TryParseChannel(p[2], out var ch, 8)) return $"DO8 CH{ch}={(_do8[ch] ? "ON" : "OFF")}";
+                if (TryParseChannel(p[2], out var readCh, 8)) return $"DO8 CH{readCh}={(_do8[readCh] ? "ON" : "OFF")}";
                 if (p[2].Equals("POWERON", StringComparison.OrdinalIgnoreCase)) return $"DO8 POWERON={_do8PowerOn}";
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase)) return $"DO8 ACTIVE={_do8Active}";
             }
 
             if (action == "SET")
             {
-                if (TryParseChannel(p[2], out var ch, 8) && p.Length >= 4)
+                if (TryParseChannel(p[2], out var setCh, 8) && p.Length >= 4)
                 {
-                    _do8[ch] = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
-                    return $"OK DO8 CH{ch}={(_do8[ch] ? "ON" : "OFF")}";
+                    _do8[setCh] = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
+                    return $"OK DO8 CH{setCh}={(_do8[setCh] ? "ON" : "OFF")}";
                 }
                 if (p[2].Equals("POWERON", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var pw))
                 {
@@ -322,17 +322,17 @@ namespace OPTA_ModbusDemo
             if (action == "READ")
             {
                 if (p[2].StartsWith("DI") && TryParseIndexAfterPrefix(p[2], "DI", out var di, 4)) return $"DIO4 DI{di}={(_dio4Di[di] ? 1 : 0)}";
-                if (p[2].Equals("COUNT", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var ch, 4)) return $"DIO4 COUNT CH{ch}={_dio4Count[ch]}";
+                if (p[2].Equals("COUNT", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var countCh, 4)) return $"DIO4 COUNT CH{countCh}={_dio4Count[countCh]}";
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase)) return $"DIO4 ACTIVE={_dio4Active}";
                 if (p[2].StartsWith("DO") && TryParseIndexAfterPrefix(p[2], "DO", out var d, 4)) return $"DIO4 DO{d}={(_dio4Do[d] ? "ON" : "OFF")}";
             }
 
             if (action == "SET")
             {
-                if (p[2].Equals("CLEAR", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var ch, 4))
+                if (p[2].Equals("CLEAR", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var clearCh, 4))
                 {
-                    _dio4Count[ch] = 0;
-                    return $"OK DIO4 COUNT CH{ch} CLEARED";
+                    _dio4Count[clearCh] = 0;
+                    return $"OK DIO4 COUNT CH{clearCh} CLEARED";
                 }
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
                 {
@@ -353,17 +353,17 @@ namespace OPTA_ModbusDemo
         {
             if (action == "READ")
             {
-                if (TryParseChannel(p[2], out var ch, 8)) return $"DI8 CH{ch}={(_di8[ch] ? 1 : 0)}";
+                if (TryParseChannel(p[2], out var readCh, 8)) return $"DI8 CH{readCh}={(_di8[readCh] ? 1 : 0)}";
                 if (p[2].Equals("COUNT", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var c, 8)) return $"DI8 COUNT CH{c}={_di8Count[c]}";
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase)) return $"DI8 ACTIVE={_di8Active}";
             }
 
             if (action == "SET")
             {
-                if (p[2].Equals("CLEAR", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var ch, 8))
+                if (p[2].Equals("CLEAR", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var clearCh, 8))
                 {
-                    _di8Count[ch] = 0;
-                    return $"OK DI8 COUNT CH{ch} CLEARED";
+                    _di8Count[clearCh] = 0;
+                    return $"OK DI8 COUNT CH{clearCh} CLEARED";
                 }
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
                 {
