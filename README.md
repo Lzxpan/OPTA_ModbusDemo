@@ -51,6 +51,7 @@ AI4 分頁 **固定顯示 `CH0~CH7`**（8 列）。
 ### AI4 分頁
 - 8 通道資料表（含 Mode/Pair/Owner/Type/Value）
 - **每個 CH 可個別設定 Type**（CH0~CH7）
+- Type 下拉選單可選：`0x0101~0x010A`、`0x0201~0x0203`
 - `READ AI4` / `SET AI4 TYPE` 命令
 - AI 輸入值每 0.5 秒自動更新
 

@@ -17,7 +17,13 @@ namespace OPTA_ModbusDemo
         private readonly DataGridView _gridDo8 = new();
         private readonly DataGridView _gridDi8 = new();
 
-        private readonly TextBox[] _aiTypeEditors = new TextBox[8];
+        private readonly ComboBox[] _aiTypeEditors = new ComboBox[8];
+        private static readonly string[] AiTypeOptions =
+        [
+            "0x0101", "0x0102", "0x0103", "0x0104", "0x0105",
+            "0x0106", "0x0107", "0x0108", "0x0109", "0x010A",
+            "0x0201", "0x0202", "0x0203"
+        ];
         private readonly Button[] _do8ToggleButtons = new Button[8];
         private readonly Button[] _dio4DoToggleButtons = new Button[4];
         private readonly Button[] _dio4DiToggleButtons = new Button[4];
@@ -153,20 +159,29 @@ namespace OPTA_ModbusDemo
 
             for (var i = 0; i < 8; i++)
             {
-                var row = i / 4;
-                var col = i % 4;
+                var chIndex = i;
+                var row = chIndex / 4;
+                var col = chIndex % 4;
                 var x = 12 + col * 255;
                 var y = 28 + row * 62;
 
-                var lbl = new Label { Text = $"CH{i}", Location = new Point(x, y + 8), AutoSize = true };
-                var txt = new TextBox { Location = new Point(x + 40, y + 4), Size = new Size(90, 26), Text = "0x0103" };
-                _aiTypeEditors[i] = txt;
-                var btn = MakeButton("套用", x + 136, y + 2, () =>
+                var lbl = new Label { Text = $"CH{chIndex}", Location = new Point(x, y + 8), AutoSize = true };
+                var cmb = new ComboBox
                 {
-                    ExecuteAndEcho($"SET AI4 CH{i} TYPE {txt.Text.Trim()}");
+                    Location = new Point(x + 40, y + 4),
+                    Size = new Size(100, 26),
+                    DropDownStyle = ComboBoxStyle.DropDownList
+                };
+                cmb.Items.AddRange(AiTypeOptions);
+                cmb.SelectedItem = "0x0103";
+                _aiTypeEditors[chIndex] = cmb;
+                var btn = MakeButton("套用", x + 146, y + 2, () =>
+                {
+                    var selected = _aiTypeEditors[chIndex].SelectedItem?.ToString() ?? "0x0103";
+                    ExecuteAndEcho($"SET AI4 CH{chIndex} TYPE {selected}");
                 }, 70, 30);
 
-                grpType.Controls.AddRange([lbl, txt, btn]);
+                grpType.Controls.AddRange([lbl, cmb, btn]);
             }
 
             var btnReadAll = MakeButton("READ AI4 ALL", 930, 130, () => ExecuteAndEcho("READ AI4 ALL"), 100, 30);
@@ -197,16 +212,17 @@ namespace OPTA_ModbusDemo
 
             for (var i = 0; i < 4; i++)
             {
-                var y = 30 + i * 46;
-                grp.Controls.Add(new Label { Text = $"CH{i}", Location = new Point(12, y + 7), AutoSize = true });
-                _dio4DiToggleButtons[i] = MakeButton("Toggle DI", 70, y, () =>
+                var chIndex = i;
+                var y = 30 + chIndex * 46;
+                grp.Controls.Add(new Label { Text = $"CH{chIndex}", Location = new Point(12, y + 7), AutoSize = true });
+                _dio4DiToggleButtons[chIndex] = MakeButton("Toggle DI", 70, y, () =>
                 {
-                    _dio4Di[i] = !_dio4Di[i];
-                    ExecuteAndEcho($"READ DIO4 DI{i}");
+                    _dio4Di[chIndex] = !_dio4Di[chIndex];
+                    ExecuteAndEcho($"READ DIO4 DI{chIndex}");
                 }, 100, 30);
-                var clear = MakeButton("Clear Count", 176, y, () => ExecuteAndEcho($"SET DIO4 CLEAR CH{i}"), 110, 30);
-                _dio4DoToggleButtons[i] = MakeButton("DO Toggle", 292, y, () => ExecuteAndEcho($"SET DIO4 DO{i} {(_dio4Do[i] ? "OFF" : "ON")}"), 110, 30);
-                grp.Controls.AddRange([_dio4DiToggleButtons[i], clear, _dio4DoToggleButtons[i]]);
+                var clear = MakeButton("Clear Count", 176, y, () => ExecuteAndEcho($"SET DIO4 CLEAR CH{chIndex}"), 110, 30);
+                _dio4DoToggleButtons[chIndex] = MakeButton("DO Toggle", 292, y, () => ExecuteAndEcho($"SET DIO4 DO{chIndex} {(_dio4Do[chIndex] ? "OFF" : "ON")}"), 110, 30);
+                grp.Controls.AddRange([_dio4DiToggleButtons[chIndex], clear, _dio4DoToggleButtons[chIndex]]);
             }
 
             grp.Controls.Add(MakeButton("READ DIO4 ACTIVE", 420, 30, () => ExecuteAndEcho("READ DIO4 ACTIVE"), 140, 32));
@@ -236,13 +252,14 @@ namespace OPTA_ModbusDemo
 
             for (var i = 0; i < 8; i++)
             {
-                var row = i / 4;
-                var col = i % 4;
+                var chIndex = i;
+                var row = chIndex / 4;
+                var col = chIndex % 4;
                 var x = 16 + col * 250;
                 var y = 34 + row * 62;
-                grp.Controls.Add(new Label { Text = $"CH{i}", Location = new Point(x, y + 8), AutoSize = true });
-                _do8ToggleButtons[i] = MakeButton("Toggle", x + 46, y + 2, () => ExecuteAndEcho($"SET DO8 CH{i} {(_do8[i] ? "OFF" : "ON")}"), 180, 32);
-                grp.Controls.Add(_do8ToggleButtons[i]);
+                grp.Controls.Add(new Label { Text = $"CH{chIndex}", Location = new Point(x, y + 8), AutoSize = true });
+                _do8ToggleButtons[chIndex] = MakeButton("Toggle", x + 46, y + 2, () => ExecuteAndEcho($"SET DO8 CH{chIndex} {(_do8[chIndex] ? "OFF" : "ON")}"), 180, 32);
+                grp.Controls.Add(_do8ToggleButtons[chIndex]);
             }
 
             grp.Controls.Add(MakeButton("READ DO8 POWERON", 16, 165, () => ExecuteAndEcho("READ DO8 POWERON"), 180, 32));
@@ -274,18 +291,19 @@ namespace OPTA_ModbusDemo
 
             for (var i = 0; i < 8; i++)
             {
-                var row = i / 4;
-                var col = i % 4;
+                var chIndex = i;
+                var row = chIndex / 4;
+                var col = chIndex % 4;
                 var x = 16 + col * 250;
                 var y = 34 + row * 62;
-                grp.Controls.Add(new Label { Text = $"CH{i}", Location = new Point(x, y + 8), AutoSize = true });
-                _di8DiToggleButtons[i] = MakeButton("Toggle DI", x + 46, y + 2, () =>
+                grp.Controls.Add(new Label { Text = $"CH{chIndex}", Location = new Point(x, y + 8), AutoSize = true });
+                _di8DiToggleButtons[chIndex] = MakeButton("Toggle DI", x + 46, y + 2, () =>
                 {
-                    _di8[i] = !_di8[i];
-                    ExecuteAndEcho($"READ DI8 CH{i}");
+                    _di8[chIndex] = !_di8[chIndex];
+                    ExecuteAndEcho($"READ DI8 CH{chIndex}");
                 }, 94, 32);
-                var clear = MakeButton("Clear", x + 146, y + 2, () => ExecuteAndEcho($"SET DI8 CLEAR CH{i}"), 80, 32);
-                grp.Controls.AddRange([_di8DiToggleButtons[i], clear]);
+                var clear = MakeButton("Clear", x + 146, y + 2, () => ExecuteAndEcho($"SET DI8 CLEAR CH{chIndex}"), 80, 32);
+                grp.Controls.AddRange([_di8DiToggleButtons[chIndex], clear]);
             }
 
             grp.Controls.Add(MakeButton("READ DI8 ACTIVE", 16, 165, () => ExecuteAndEcho("READ DI8 ACTIVE"), 180, 32));
@@ -540,7 +558,13 @@ namespace OPTA_ModbusDemo
                     _di8DiToggleButtons[i].Text = $"Toggle DI ({(_di8[i] ? 1 : 0)})";
 
                 if (_aiTypeEditors[i] != null)
-                    _aiTypeEditors[i].Text = $"0x{_aiType[i]:X4}";
+                {
+                    var target = $"0x{_aiType[i]:X4}";
+                    if (!_aiTypeEditors[i].DroppedDown && !string.Equals(_aiTypeEditors[i].SelectedItem?.ToString(), target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _aiTypeEditors[i].SelectedItem = target;
+                    }
+                }
             }
 
             for (var i = 0; i < 4; i++)
