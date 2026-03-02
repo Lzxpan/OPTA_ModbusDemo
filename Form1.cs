@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 
 namespace OPTA_ModbusDemo
@@ -16,11 +17,17 @@ namespace OPTA_ModbusDemo
         private readonly DataGridView _gridDo8 = new();
         private readonly DataGridView _gridDi8 = new();
 
+        private readonly TextBox[] _aiTypeEditors = new TextBox[8];
+        private readonly Button[] _do8ToggleButtons = new Button[8];
+        private readonly Button[] _dio4DoToggleButtons = new Button[4];
+        private readonly Button[] _dio4DiToggleButtons = new Button[4];
+        private readonly Button[] _di8DiToggleButtons = new Button[8];
+
         private readonly int[] _aiRaw = new int[8];
         private readonly ushort[] _aiType = new ushort[8];
 
         private readonly bool[] _do8 = new bool[8];
-        private int _do8PowerOn = 0;
+        private int _do8PowerOn;
         private int _do8Active = 1;
 
         private readonly bool[] _dio4Di = new bool[4];
@@ -32,20 +39,59 @@ namespace OPTA_ModbusDemo
         private readonly int[] _di8Count = new int[8];
         private int _di8Active = 1;
 
+        private readonly System.Windows.Forms.Timer _refreshTimer = new();
+        private readonly Random _rnd = new(42);
+
         public Form1()
         {
             InitializeComponent();
             BuildLayout();
             InitializeDemoState();
+            ConfigureRefreshTimer();
             RefreshAllViews();
             AppendConsole("系統啟動完成。輸入 HELP 查看指令。", "INFO");
+        }
+
+        private void ConfigureRefreshTimer()
+        {
+            _refreshTimer.Interval = 500;
+            _refreshTimer.Tick += (_, _) =>
+            {
+                SimulateInputUpdate();
+                RefreshAllViews();
+            };
+            _refreshTimer.Start();
+        }
+
+        private void SimulateInputUpdate()
+        {
+            for (var i = 0; i < 8; i++)
+            {
+                var delta = _rnd.Next(-180000, 180001);
+                _aiRaw[i] = Math.Clamp(_aiRaw[i] + delta, 0, 16_777_215);
+
+                if (_rnd.NextDouble() < 0.15)
+                {
+                    _di8[i] = !_di8[i];
+                }
+                if (_di8[i]) _di8Count[i] += _rnd.Next(0, 5);
+            }
+
+            for (var i = 0; i < 4; i++)
+            {
+                if (_rnd.NextDouble() < 0.2)
+                {
+                    _dio4Di[i] = !_dio4Di[i];
+                }
+                if (_dio4Di[i]) _dio4Count[i] += _rnd.Next(0, 4);
+            }
         }
 
         private void BuildLayout()
         {
             Text = "Opta Modbus TCP Multi-Device Demo";
-            Width = 1500;
-            Height = 900;
+            Width = 1520;
+            Height = 920;
             StartPosition = FormStartPosition.CenterScreen;
 
             _lblHeader.Text = "Opta Modbus TCP Multi-Device Demo";
@@ -53,28 +99,27 @@ namespace OPTA_ModbusDemo
             _lblHeader.AutoSize = true;
             _lblHeader.Location = new Point(16, 12);
 
-            _lblSubHeader.Text = "Opta 192.168.2.100:5000｜AI4(111) DO8(112) DIO4(113) DI8(114)";
+            _lblSubHeader.Text = "Opta 192.168.2.100:5000｜AI4(111) DO8(112) DIO4(113) DI8(114)｜輸入每 0.5 秒更新";
             _lblSubHeader.ForeColor = Color.DimGray;
             _lblSubHeader.AutoSize = true;
             _lblSubHeader.Location = new Point(18, 44);
 
             _tabDevices.Location = new Point(16, 74);
-            _tabDevices.Size = new Size(1060, 760);
+            _tabDevices.Size = new Size(1080, 790);
 
             var aiPage = new TabPage("AI4") { BackColor = Color.WhiteSmoke };
             var dio4Page = new TabPage("DIO4") { BackColor = Color.WhiteSmoke };
             var do8Page = new TabPage("DO8") { BackColor = Color.WhiteSmoke };
             var di8Page = new TabPage("DI8") { BackColor = Color.WhiteSmoke };
-            _tabDevices.TabPages.AddRange(new[] { aiPage, dio4Page, do8Page, di8Page });
+            _tabDevices.TabPages.AddRange([aiPage, dio4Page, do8Page, di8Page]);
 
             BuildAiTab(aiPage);
             BuildDio4Tab(dio4Page);
             BuildDo8Tab(do8Page);
             BuildDi8Tab(di8Page);
-
             BuildConsolePanel();
 
-            Controls.AddRange(new Control[] { _lblHeader, _lblSubHeader, _tabDevices, _txtConsole, _txtCommand });
+            Controls.AddRange([_lblHeader, _lblSubHeader, _tabDevices, _txtConsole, _txtCommand]);
         }
 
         private void BuildAiTab(TabPage page)
@@ -85,7 +130,7 @@ namespace OPTA_ModbusDemo
             _lblAiMode.Font = new Font("Segoe UI", 10, FontStyle.Bold);
 
             _gridAi.Location = new Point(12, 40);
-            _gridAi.Size = new Size(1018, 530);
+            _gridAi.Size = new Size(1040, 460);
             _gridAi.AllowUserToAddRows = false;
             _gridAi.ReadOnly = true;
             _gridAi.RowHeadersVisible = false;
@@ -99,19 +144,41 @@ namespace OPTA_ModbusDemo
             _gridAi.Columns.Add("Type", "Type");
             _gridAi.Columns.Add("Value", "Value");
 
-            var y = 590;
-            page.Controls.Add(MakeButton("READ AI4 ALL", 12, y, () => ExecuteAndEcho("READ AI4 ALL")));
-            page.Controls.Add(MakeButton("SET AI4 TYPE 0x0103", 180, y, () => ExecuteAndEcho("SET AI4 TYPE 0x0103")));
-            page.Controls.Add(MakeButton("SET AI4 TYPE 0x0106", 378, y, () => ExecuteAndEcho("SET AI4 TYPE 0x0106")));
-            page.Controls.Add(MakeButton("SET AI4 TYPE 0x0203", 576, y, () => ExecuteAndEcho("SET AI4 TYPE 0x0203")));
-            page.Controls.Add(MakeButton("SET AI4 CH6 TYPE 0x0108", 774, y, () => ExecuteAndEcho("SET AI4 CH6 TYPE 0x0108")));
-            page.Controls.AddRange(new Control[] { _lblAiMode, _gridAi });
+            var grpType = new GroupBox
+            {
+                Text = "AI4 Type 個別設定（每 CH 可獨立設定）",
+                Location = new Point(12, 510),
+                Size = new Size(1040, 170)
+            };
+
+            for (var i = 0; i < 8; i++)
+            {
+                var row = i / 4;
+                var col = i % 4;
+                var x = 12 + col * 255;
+                var y = 28 + row * 62;
+
+                var lbl = new Label { Text = $"CH{i}", Location = new Point(x, y + 8), AutoSize = true };
+                var txt = new TextBox { Location = new Point(x + 40, y + 4), Size = new Size(90, 26), Text = "0x0103" };
+                _aiTypeEditors[i] = txt;
+                var btn = MakeButton("套用", x + 136, y + 2, () =>
+                {
+                    ExecuteAndEcho($"SET AI4 CH{i} TYPE {txt.Text.Trim()}");
+                }, 70, 30);
+
+                grpType.Controls.AddRange([lbl, txt, btn]);
+            }
+
+            var btnReadAll = MakeButton("READ AI4 ALL", 930, 130, () => ExecuteAndEcho("READ AI4 ALL"), 100, 30);
+            grpType.Controls.Add(btnReadAll);
+
+            page.Controls.AddRange([_lblAiMode, _gridAi, grpType]);
         }
 
         private void BuildDio4Tab(TabPage page)
         {
             _gridDio4.Location = new Point(12, 20);
-            _gridDio4.Size = new Size(1018, 550);
+            _gridDio4.Size = new Size(1040, 420);
             _gridDio4.AllowUserToAddRows = false;
             _gridDio4.ReadOnly = true;
             _gridDio4.RowHeadersVisible = false;
@@ -121,19 +188,38 @@ namespace OPTA_ModbusDemo
             _gridDio4.Columns.Add("Count", "Count");
             _gridDio4.Columns.Add("DO", "DO State");
 
-            var y = 590;
-            page.Controls.Add(MakeButton("READ DIO4 COUNT CH0", 12, y, () => ExecuteAndEcho("READ DIO4 COUNT CH0")));
-            page.Controls.Add(MakeButton("SET DIO4 CLEAR CH0", 220, y, () => ExecuteAndEcho("SET DIO4 CLEAR CH0")));
-            page.Controls.Add(MakeButton("SET DIO4 DO0 ON", 428, y, () => ExecuteAndEcho("SET DIO4 DO0 ON")));
-            page.Controls.Add(MakeButton("SET DIO4 DO0 OFF", 616, y, () => ExecuteAndEcho("SET DIO4 DO0 OFF")));
-            page.Controls.Add(MakeButton("READ DIO4 ACTIVE", 804, y, () => ExecuteAndEcho("READ DIO4 ACTIVE")));
-            page.Controls.Add(_gridDio4);
+            var grp = new GroupBox
+            {
+                Text = "DIO4 每 CH 控制",
+                Location = new Point(12, 450),
+                Size = new Size(1040, 230)
+            };
+
+            for (var i = 0; i < 4; i++)
+            {
+                var y = 30 + i * 46;
+                grp.Controls.Add(new Label { Text = $"CH{i}", Location = new Point(12, y + 7), AutoSize = true });
+                _dio4DiToggleButtons[i] = MakeButton("Toggle DI", 70, y, () =>
+                {
+                    _dio4Di[i] = !_dio4Di[i];
+                    ExecuteAndEcho($"READ DIO4 DI{i}");
+                }, 100, 30);
+                var clear = MakeButton("Clear Count", 176, y, () => ExecuteAndEcho($"SET DIO4 CLEAR CH{i}"), 110, 30);
+                _dio4DoToggleButtons[i] = MakeButton("DO Toggle", 292, y, () => ExecuteAndEcho($"SET DIO4 DO{i} {(_dio4Do[i] ? "OFF" : "ON")}"), 110, 30);
+                grp.Controls.AddRange([_dio4DiToggleButtons[i], clear, _dio4DoToggleButtons[i]]);
+            }
+
+            grp.Controls.Add(MakeButton("READ DIO4 ACTIVE", 420, 30, () => ExecuteAndEcho("READ DIO4 ACTIVE"), 140, 32));
+            grp.Controls.Add(MakeButton("SET DIO4 ACTIVE 1", 570, 30, () => ExecuteAndEcho("SET DIO4 ACTIVE 1"), 140, 32));
+            grp.Controls.Add(MakeButton("SET DIO4 ACTIVE 0", 720, 30, () => ExecuteAndEcho("SET DIO4 ACTIVE 0"), 140, 32));
+
+            page.Controls.AddRange([_gridDio4, grp]);
         }
 
         private void BuildDo8Tab(TabPage page)
         {
             _gridDo8.Location = new Point(12, 20);
-            _gridDo8.Size = new Size(1018, 550);
+            _gridDo8.Size = new Size(1040, 420);
             _gridDo8.AllowUserToAddRows = false;
             _gridDo8.ReadOnly = true;
             _gridDo8.RowHeadersVisible = false;
@@ -141,20 +227,36 @@ namespace OPTA_ModbusDemo
             _gridDo8.Columns.Add("Channel", "CH");
             _gridDo8.Columns.Add("State", "Output");
 
-            var y = 590;
-            page.Controls.Add(MakeButton("SET DO8 CH0 ON", 12, y, () => ExecuteAndEcho("SET DO8 CH0 ON")));
-            page.Controls.Add(MakeButton("SET DO8 CH0 OFF", 170, y, () => ExecuteAndEcho("SET DO8 CH0 OFF")));
-            page.Controls.Add(MakeButton("READ DO8 POWERON", 340, y, () => ExecuteAndEcho("READ DO8 POWERON")));
-            page.Controls.Add(MakeButton("SET DO8 POWERON 1", 520, y, () => ExecuteAndEcho("SET DO8 POWERON 1")));
-            page.Controls.Add(MakeButton("READ DO8 ACTIVE", 700, y, () => ExecuteAndEcho("READ DO8 ACTIVE")));
-            page.Controls.Add(MakeButton("SET DO8 ACTIVE 1", 860, y, () => ExecuteAndEcho("SET DO8 ACTIVE 1")));
-            page.Controls.Add(_gridDo8);
+            var grp = new GroupBox
+            {
+                Text = "DO8 每 CH 控制（單一 Toggle 按鈕）",
+                Location = new Point(12, 450),
+                Size = new Size(1040, 230)
+            };
+
+            for (var i = 0; i < 8; i++)
+            {
+                var row = i / 4;
+                var col = i % 4;
+                var x = 16 + col * 250;
+                var y = 34 + row * 62;
+                grp.Controls.Add(new Label { Text = $"CH{i}", Location = new Point(x, y + 8), AutoSize = true });
+                _do8ToggleButtons[i] = MakeButton("Toggle", x + 46, y + 2, () => ExecuteAndEcho($"SET DO8 CH{i} {(_do8[i] ? "OFF" : "ON")}"), 180, 32);
+                grp.Controls.Add(_do8ToggleButtons[i]);
+            }
+
+            grp.Controls.Add(MakeButton("READ DO8 POWERON", 16, 165, () => ExecuteAndEcho("READ DO8 POWERON"), 180, 32));
+            grp.Controls.Add(MakeButton("SET DO8 POWERON 1", 210, 165, () => ExecuteAndEcho("SET DO8 POWERON 1"), 180, 32));
+            grp.Controls.Add(MakeButton("READ DO8 ACTIVE", 404, 165, () => ExecuteAndEcho("READ DO8 ACTIVE"), 180, 32));
+            grp.Controls.Add(MakeButton("SET DO8 ACTIVE 1", 598, 165, () => ExecuteAndEcho("SET DO8 ACTIVE 1"), 180, 32));
+
+            page.Controls.AddRange([_gridDo8, grp]);
         }
 
         private void BuildDi8Tab(TabPage page)
         {
             _gridDi8.Location = new Point(12, 20);
-            _gridDi8.Size = new Size(1018, 550);
+            _gridDi8.Size = new Size(1040, 420);
             _gridDi8.AllowUserToAddRows = false;
             _gridDi8.ReadOnly = true;
             _gridDi8.RowHeadersVisible = false;
@@ -163,35 +265,56 @@ namespace OPTA_ModbusDemo
             _gridDi8.Columns.Add("State", "DI State");
             _gridDi8.Columns.Add("Count", "Count");
 
-            var y = 590;
-            page.Controls.Add(MakeButton("READ DI8 COUNT CH0", 12, y, () => ExecuteAndEcho("READ DI8 COUNT CH0")));
-            page.Controls.Add(MakeButton("SET DI8 CLEAR CH0", 220, y, () => ExecuteAndEcho("SET DI8 CLEAR CH0")));
-            page.Controls.Add(MakeButton("READ DI8 ACTIVE", 428, y, () => ExecuteAndEcho("READ DI8 ACTIVE")));
-            page.Controls.Add(MakeButton("SET DI8 ACTIVE 1", 616, y, () => ExecuteAndEcho("SET DI8 ACTIVE 1")));
-            page.Controls.Add(_gridDi8);
+            var grp = new GroupBox
+            {
+                Text = "DI8 每 CH 控制",
+                Location = new Point(12, 450),
+                Size = new Size(1040, 230)
+            };
+
+            for (var i = 0; i < 8; i++)
+            {
+                var row = i / 4;
+                var col = i % 4;
+                var x = 16 + col * 250;
+                var y = 34 + row * 62;
+                grp.Controls.Add(new Label { Text = $"CH{i}", Location = new Point(x, y + 8), AutoSize = true });
+                _di8DiToggleButtons[i] = MakeButton("Toggle DI", x + 46, y + 2, () =>
+                {
+                    _di8[i] = !_di8[i];
+                    ExecuteAndEcho($"READ DI8 CH{i}");
+                }, 94, 32);
+                var clear = MakeButton("Clear", x + 146, y + 2, () => ExecuteAndEcho($"SET DI8 CLEAR CH{i}"), 80, 32);
+                grp.Controls.AddRange([_di8DiToggleButtons[i], clear]);
+            }
+
+            grp.Controls.Add(MakeButton("READ DI8 ACTIVE", 16, 165, () => ExecuteAndEcho("READ DI8 ACTIVE"), 180, 32));
+            grp.Controls.Add(MakeButton("SET DI8 ACTIVE 1", 210, 165, () => ExecuteAndEcho("SET DI8 ACTIVE 1"), 180, 32));
+
+            page.Controls.AddRange([_gridDi8, grp]);
         }
 
         private void BuildConsolePanel()
         {
-            _txtConsole.Location = new Point(1088, 74);
-            _txtConsole.Size = new Size(390, 710);
+            _txtConsole.Location = new Point(1108, 74);
+            _txtConsole.Size = new Size(390, 750);
             _txtConsole.ReadOnly = true;
             _txtConsole.BackColor = Color.FromArgb(15, 23, 42);
             _txtConsole.ForeColor = Color.AliceBlue;
             _txtConsole.Font = new Font("Consolas", 10);
 
-            _txtCommand.Location = new Point(1088, 795);
+            _txtCommand.Location = new Point(1108, 834);
             _txtCommand.Size = new Size(390, 30);
             _txtCommand.KeyDown += TxtCommand_KeyDown;
         }
 
-        private Button MakeButton(string text, int x, int y, Action onClick)
+        private Button MakeButton(string text, int x, int y, Action onClick, int width = 160, int height = 36)
         {
             var btn = new Button
             {
                 Text = text,
                 Location = new Point(x, y),
-                Size = new Size(160, 36),
+                Size = new Size(width, height),
                 BackColor = Color.FromArgb(234, 243, 255)
             };
             btn.Click += (_, _) => onClick();
@@ -200,14 +323,12 @@ namespace OPTA_ModbusDemo
 
         private void TxtCommand_KeyDown(object? sender, KeyEventArgs e)
         {
-            if (e.KeyCode == Keys.Enter)
-            {
-                e.SuppressKeyPress = true;
-                var cmd = _txtCommand.Text.Trim();
-                if (string.IsNullOrWhiteSpace(cmd)) return;
-                ExecuteAndEcho(cmd);
-                _txtCommand.Clear();
-            }
+            if (e.KeyCode != Keys.Enter) return;
+            e.SuppressKeyPress = true;
+            var cmd = _txtCommand.Text.Trim();
+            if (string.IsNullOrWhiteSpace(cmd)) return;
+            ExecuteAndEcho(cmd);
+            _txtCommand.Clear();
         }
 
         private void ExecuteAndEcho(string cmd)
@@ -255,7 +376,7 @@ namespace OPTA_ModbusDemo
                 if (p[2].Equals("ALL", StringComparison.OrdinalIgnoreCase))
                 {
                     var sb = new StringBuilder();
-                    for (var ch = 0; ch < 8; ch++) sb.Append($"CH{ch}={FormatAiValue(ch)} ");
+                    for (var i = 0; i < 8; i++) sb.Append($"CH{i}={FormatAiValue(i)} ");
                     return sb.ToString().Trim();
                 }
 
@@ -270,16 +391,16 @@ namespace OPTA_ModbusDemo
             {
                 if (p.Length >= 4 && p[2].Equals("TYPE", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!TryParseType(p[3], out var type)) return "ERR TYPE format";
-                    for (var i = 0; i < 8; i++) _aiType[i] = type;
-                    return $"OK AI4 TYPE=0x{type:X4}";
+                    if (!TryParseType(p[3], out var globalType)) return "ERR TYPE format";
+                    for (var i = 0; i < 8; i++) _aiType[i] = globalType;
+                    return $"OK AI4 TYPE=0x{globalType:X4}";
                 }
 
                 if (p.Length >= 5 && TryParseChannel(p[2], out var setCh, 8) && p[3].Equals("TYPE", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!TryParseType(p[4], out var type)) return "ERR TYPE format";
-                    _aiType[setCh] = type;
-                    return $"OK AI4 CH{setCh} TYPE=0x{type:X4}";
+                    if (!TryParseType(p[4], out var channelType)) return "ERR TYPE format";
+                    _aiType[setCh] = channelType;
+                    return $"OK AI4 CH{setCh} TYPE=0x{channelType:X4}";
                 }
             }
 
@@ -302,11 +423,13 @@ namespace OPTA_ModbusDemo
                     _do8[setCh] = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
                     return $"OK DO8 CH{setCh}={(_do8[setCh] ? "ON" : "OFF")}";
                 }
+
                 if (p[2].Equals("POWERON", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var pw))
                 {
                     _do8PowerOn = pw;
                     return $"OK DO8 POWERON={pw}";
                 }
+
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
                 {
                     _do8Active = av;
@@ -324,7 +447,7 @@ namespace OPTA_ModbusDemo
                 if (p[2].StartsWith("DI") && TryParseIndexAfterPrefix(p[2], "DI", out var di, 4)) return $"DIO4 DI{di}={(_dio4Di[di] ? 1 : 0)}";
                 if (p[2].Equals("COUNT", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var countCh, 4)) return $"DIO4 COUNT CH{countCh}={_dio4Count[countCh]}";
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase)) return $"DIO4 ACTIVE={_dio4Active}";
-                if (p[2].StartsWith("DO") && TryParseIndexAfterPrefix(p[2], "DO", out var d, 4)) return $"DIO4 DO{d}={(_dio4Do[d] ? "ON" : "OFF")}";
+                if (p[2].StartsWith("DO") && TryParseIndexAfterPrefix(p[2], "DO", out var dout, 4)) return $"DIO4 DO{dout}={(_dio4Do[dout] ? "ON" : "OFF")}";
             }
 
             if (action == "SET")
@@ -334,15 +457,17 @@ namespace OPTA_ModbusDemo
                     _dio4Count[clearCh] = 0;
                     return $"OK DIO4 COUNT CH{clearCh} CLEARED";
                 }
+
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
                 {
                     _dio4Active = av;
                     return $"OK DIO4 ACTIVE={av}";
                 }
-                if (p[2].StartsWith("DO") && TryParseIndexAfterPrefix(p[2], "DO", out var d, 4) && p.Length >= 4)
+
+                if (p[2].StartsWith("DO") && TryParseIndexAfterPrefix(p[2], "DO", out var dout, 4) && p.Length >= 4)
                 {
-                    _dio4Do[d] = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
-                    return $"OK DIO4 DO{d}={(_dio4Do[d] ? "ON" : "OFF")}";
+                    _dio4Do[dout] = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
+                    return $"OK DIO4 DO{dout}={(_dio4Do[dout] ? "ON" : "OFF")}";
                 }
             }
 
@@ -354,7 +479,7 @@ namespace OPTA_ModbusDemo
             if (action == "READ")
             {
                 if (TryParseChannel(p[2], out var readCh, 8)) return $"DI8 CH{readCh}={(_di8[readCh] ? 1 : 0)}";
-                if (p[2].Equals("COUNT", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var c, 8)) return $"DI8 COUNT CH{c}={_di8Count[c]}";
+                if (p[2].Equals("COUNT", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var countCh, 8)) return $"DI8 COUNT CH{countCh}={_di8Count[countCh]}";
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase)) return $"DI8 ACTIVE={_di8Active}";
             }
 
@@ -365,6 +490,7 @@ namespace OPTA_ModbusDemo
                     _di8Count[clearCh] = 0;
                     return $"OK DI8 COUNT CH{clearCh} CLEARED";
                 }
+
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
                 {
                     _di8Active = av;
@@ -377,21 +503,20 @@ namespace OPTA_ModbusDemo
 
         private void InitializeDemoState()
         {
-            var rnd = new Random(42);
             for (var i = 0; i < 8; i++)
             {
-                _aiRaw[i] = rnd.Next(3_000_000, 15_000_000);
+                _aiRaw[i] = _rnd.Next(3_000_000, 15_000_000);
                 _aiType[i] = 0x0103;
                 _do8[i] = i % 2 == 0;
                 _di8[i] = i % 3 == 0;
-                _di8Count[i] = rnd.Next(0, 1000);
+                _di8Count[i] = _rnd.Next(0, 1000);
             }
 
             for (var i = 0; i < 4; i++)
             {
                 _dio4Di[i] = i % 2 == 1;
                 _dio4Do[i] = i % 2 == 0;
-                _dio4Count[i] = rnd.Next(0, 500);
+                _dio4Count[i] = _rnd.Next(0, 500);
             }
         }
 
@@ -401,6 +526,31 @@ namespace OPTA_ModbusDemo
             RefreshDio4Grid();
             RefreshDo8Grid();
             RefreshDi8Grid();
+            RefreshButtonTexts();
+        }
+
+        private void RefreshButtonTexts()
+        {
+            for (var i = 0; i < 8; i++)
+            {
+                if (_do8ToggleButtons[i] != null)
+                    _do8ToggleButtons[i].Text = $"Toggle ({(_do8[i] ? "ON" : "OFF")})";
+
+                if (_di8DiToggleButtons[i] != null)
+                    _di8DiToggleButtons[i].Text = $"Toggle DI ({(_di8[i] ? 1 : 0)})";
+
+                if (_aiTypeEditors[i] != null)
+                    _aiTypeEditors[i].Text = $"0x{_aiType[i]:X4}";
+            }
+
+            for (var i = 0; i < 4; i++)
+            {
+                if (_dio4DoToggleButtons[i] != null)
+                    _dio4DoToggleButtons[i].Text = $"DO Toggle ({(_dio4Do[i] ? "ON" : "OFF")})";
+
+                if (_dio4DiToggleButtons[i] != null)
+                    _dio4DiToggleButtons[i].Text = $"Toggle DI ({(_dio4Di[i] ? 1 : 0)})";
+            }
         }
 
         private void RefreshAiGrid()
@@ -428,19 +578,28 @@ namespace OPTA_ModbusDemo
         private void RefreshDio4Grid()
         {
             _gridDio4.Rows.Clear();
-            for (var i = 0; i < 4; i++) _gridDio4.Rows.Add($"CH{i}", _dio4Di[i] ? "1" : "0", _dio4Count[i], _dio4Do[i] ? "ON" : "OFF");
+            for (var i = 0; i < 4; i++)
+            {
+                _gridDio4.Rows.Add($"CH{i}", _dio4Di[i] ? "1" : "0", _dio4Count[i], _dio4Do[i] ? "ON" : "OFF");
+            }
         }
 
         private void RefreshDo8Grid()
         {
             _gridDo8.Rows.Clear();
-            for (var i = 0; i < 8; i++) _gridDo8.Rows.Add($"CH{i}", _do8[i] ? "ON" : "OFF");
+            for (var i = 0; i < 8; i++)
+            {
+                _gridDo8.Rows.Add($"CH{i}", _do8[i] ? "ON" : "OFF");
+            }
         }
 
         private void RefreshDi8Grid()
         {
             _gridDi8.Rows.Clear();
-            for (var i = 0; i < 8; i++) _gridDi8.Rows.Add($"CH{i}", _di8[i] ? "1" : "0", _di8Count[i]);
+            for (var i = 0; i < 8; i++)
+            {
+                _gridDi8.Rows.Add($"CH{i}", _di8[i] ? "1" : "0", _di8Count[i]);
+            }
         }
 
         private string FormatAiValue(int ch)
@@ -480,7 +639,7 @@ namespace OPTA_ModbusDemo
             token = token.Trim();
             if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
             {
-                return ushort.TryParse(token[2..], System.Globalization.NumberStyles.HexNumber, null, out type);
+                return ushort.TryParse(token[2..], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out type);
             }
             return ushort.TryParse(token, out type);
         }

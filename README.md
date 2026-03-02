@@ -7,7 +7,7 @@
 - DO8（數位輸出）
 - DI8（數位輸入）
 
-> 目前版本重點是完成 UI 與命令互動流程（頁面/按鈕/命令解析）。
+> 目前版本重點是完成 UI 與命令互動流程（頁面/按鈕/命令解析），並加入 0.5 秒輸入自動更新。
 
 ---
 
@@ -50,23 +50,25 @@ AI4 分頁 **固定顯示 `CH0~CH7`**（8 列）。
 
 ### AI4 分頁
 - 8 通道資料表（含 Mode/Pair/Owner/Type/Value）
-- Type 快捷按鈕（全域與單通道）
+- **每個 CH 可個別設定 Type**（CH0~CH7）
 - `READ AI4` / `SET AI4 TYPE` 命令
+- AI 輸入值每 0.5 秒自動更新
 
 ### DIO4 分頁
-- DI 狀態
-- Counter 讀取與清除
-- DO 狀態與 ON/OFF
+- DI 狀態（每 0.5 秒更新）
+- Counter 讀取與清除（每 CH）
+- DO 狀態與 **每 CH Toggle 控制（單一按鈕反向）**
 - Active 讀寫
 
 ### DO8 分頁
 - CH0~CH7 輸出狀態
-- CH ON/OFF
+- **每 CH Toggle 控制（按一次 ON/OFF 反向）**
 - PowerOn / Active 讀寫
 
 ### DI8 分頁
-- DI 狀態、Count
-- Counter Clear
+- DI 狀態、Count（每 0.5 秒更新）
+- Counter Clear（每 CH）
+- DI 模擬切換按鈕（每 CH）
 - Active 讀寫
 
 ### 右側 Console
