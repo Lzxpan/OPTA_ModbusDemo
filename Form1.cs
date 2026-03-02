@@ -557,14 +557,6 @@ namespace OPTA_ModbusDemo
                 if (_di8DiToggleButtons[i] != null)
                     _di8DiToggleButtons[i].Text = $"Toggle DI ({(_di8[i] ? 1 : 0)})";
 
-                if (_aiTypeEditors[i] != null)
-                {
-                    var target = $"0x{_aiType[i]:X4}";
-                    if (!_aiTypeEditors[i].DroppedDown && !string.Equals(_aiTypeEditors[i].SelectedItem?.ToString(), target, StringComparison.OrdinalIgnoreCase))
-                    {
-                        _aiTypeEditors[i].SelectedItem = target;
-                    }
-                }
             }
 
             for (var i = 0; i < 4; i++)
