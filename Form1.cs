@@ -70,7 +70,7 @@ namespace OPTA_ModbusDemo
         private CancellationTokenSource? _tcpCts;
         private bool _tcpServerRunning;
         private const int TcpPort = 5000;
-        private const string TcpBindIp = OptaIp;
+        private const string TcpBindIp = "0.0.0.0";
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
@@ -109,7 +109,7 @@ namespace OPTA_ModbusDemo
             _lblHeader.AutoSize = true;
             _lblHeader.Location = new Point(16, 12);
 
-            _lblSubHeader.Text = $"Opta {OptaIp}:5000｜AI4(111) DO8(112) DIO4(113) DI8(114)";
+            _lblSubHeader.Text = $"Target Opta {OptaIp}｜Local TCP Cmd {TcpBindIp}:{TcpPort}｜AI4(111) DO8(112) DIO4(113) DI8(114)";
             _lblSubHeader.ForeColor = Color.DimGray;
             _lblSubHeader.AutoSize = true;
             _lblSubHeader.Location = new Point(18, 44);
