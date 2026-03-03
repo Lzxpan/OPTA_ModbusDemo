@@ -72,6 +72,9 @@ namespace OPTA_ModbusDemo
         private const int TcpPort = 5000;
         private const string TcpBindIp = OptaIp;
 
+        private readonly SemaphoreSlim _pollLock = new(1, 1);
+        private bool _pollInFlight;
+
         public Form1()
         {
             InitializeComponent();
@@ -79,8 +82,7 @@ namespace OPTA_ModbusDemo
             InitializeDemoState();
             ConfigureRefreshTimer();
             StartTcpServer();
-            PollAllDevices();
-            RefreshAllViews();
+            _ = TriggerPollAndRefreshAsync();
             AppendConsole("系統啟動完成。輸入 HELP 查看指令。", "INFO");
             FormClosing += (_, _) => StopTcpServer();
         }
@@ -90,8 +92,7 @@ namespace OPTA_ModbusDemo
             _refreshTimer.Interval = 500;
             _refreshTimer.Tick += (_, _) =>
             {
-                PollAllDevices();
-                RefreshAllViews();
+                _ = TriggerPollAndRefreshAsync();
             };
             _refreshTimer.Start();
         }
@@ -718,6 +719,37 @@ namespace OPTA_ModbusDemo
             label.ForeColor = Color.White;
         }
 
+        private async Task TriggerPollAndRefreshAsync()
+        {
+            if (_pollInFlight) return;
+            _pollInFlight = true;
+            try
+            {
+                await _pollLock.WaitAsync();
+                try
+                {
+                    await Task.Run(PollAllDevices);
+                }
+                finally
+                {
+                    _pollLock.Release();
+                }
+
+                if (!IsDisposed)
+                {
+                    BeginInvoke(new Action(RefreshAllViews));
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!IsDisposed) BeginInvoke(new Action(() => AppendConsole($"Poll error: {ex.Message}", "ERR")));
+            }
+            finally
+            {
+                _pollInFlight = false;
+            }
+        }
+
         private void PollAllDevices()
         {
             _isAi4Connected = PollAi4();
@@ -888,9 +920,13 @@ namespace OPTA_ModbusDemo
         private static byte[] ModbusSend(string ip, byte unitId, byte[] pdu)
         {
             using var client = new TcpClient();
-            client.ReceiveTimeout = 800;
-            client.SendTimeout = 800;
-            client.Connect(ip, 502);
+            client.ReceiveTimeout = 500;
+            client.SendTimeout = 500;
+            var connectTask = client.ConnectAsync(ip, 502);
+            if (!connectTask.Wait(500))
+            {
+                throw new IOException($"Connect timeout to {ip}:502");
+            }
             using var stream = client.GetStream();
 
             var tid = (ushort)Environment.TickCount;
