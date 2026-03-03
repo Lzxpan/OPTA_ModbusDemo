@@ -737,7 +737,11 @@ namespace OPTA_ModbusDemo
 
                 if (!IsDisposed)
                 {
-                    BeginInvoke(new Action(RefreshAllViews));
+                    BeginInvoke(new Action(() =>
+                    {
+                        UpdateStatusLabels();
+                        RefreshAllViews();
+                    }));
                 }
             }
             catch (Exception ex)
@@ -756,11 +760,17 @@ namespace OPTA_ModbusDemo
             _isDo8Connected = PollDo8();
             _isDio4Connected = PollDio4();
             _isDi8Connected = PollDi8();
-            UpdateStatusLabels();
         }
 
         private void UpdateStatusLabels()
         {
+            if (IsDisposed || !IsHandleCreated) return;
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(UpdateStatusLabels));
+                return;
+            }
+
             SetStatus(_lblAi4Status, "AI4", _isAi4Connected);
             SetStatus(_lblDo8Status, "DO8", _isDo8Connected);
             SetStatus(_lblDio4Status, "DIO4", _isDio4Connected);
