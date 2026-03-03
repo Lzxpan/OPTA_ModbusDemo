@@ -1,8 +1,8 @@
 using System.Globalization;
 using System.IO;
-using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace OPTA_ModbusDemo
 {
@@ -56,21 +56,15 @@ namespace OPTA_ModbusDemo
         private bool _isDi8Connected;
 
         private const string OptaIp = "192.168.2.100";
-        private const string Ai4Ip = "192.168.2.111";
-        private const string Do8Ip = "192.168.2.112";
-        private const string Dio4Ip = "192.168.2.113";
-        private const string Di8Ip = "192.168.2.114";
 
         private readonly Label _lblAi4Status = new();
         private readonly Label _lblDo8Status = new();
         private readonly Label _lblDio4Status = new();
         private readonly Label _lblDi8Status = new();
 
-        private TcpListener? _tcpListener;
-        private CancellationTokenSource? _tcpCts;
-        private bool _tcpServerRunning;
-        private const int TcpPort = 5000;
-        private const string TcpBindIp = "0.0.0.0";
+        private const int OptaTcpPort = 5000;
+        private readonly object _optaIoSync = new();
+        private readonly string[] _aiValueText = new string[8];
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
@@ -81,10 +75,8 @@ namespace OPTA_ModbusDemo
             BuildLayout();
             InitializeDemoState();
             ConfigureRefreshTimer();
-            StartTcpServer();
             _ = TriggerPollAndRefreshAsync();
             AppendConsole("系統啟動完成。輸入 HELP 查看指令。", "INFO");
-            FormClosing += (_, _) => StopTcpServer();
         }
 
         private void ConfigureRefreshTimer()
@@ -109,7 +101,7 @@ namespace OPTA_ModbusDemo
             _lblHeader.AutoSize = true;
             _lblHeader.Location = new Point(16, 12);
 
-            _lblSubHeader.Text = $"Target Opta {OptaIp}｜Local TCP Cmd {TcpBindIp}:{TcpPort}｜AI4(111) DO8(112) DIO4(113) DI8(114)";
+            _lblSubHeader.Text = $"TCP Client -> Opta {OptaIp}:{OptaTcpPort}｜AI4(111) DO8(112) DIO4(113) DI8(114)";
             _lblSubHeader.ForeColor = Color.DimGray;
             _lblSubHeader.AutoSize = true;
             _lblSubHeader.Location = new Point(18, 44);
@@ -371,172 +363,41 @@ namespace OPTA_ModbusDemo
 
             if (p[0].Equals("HELP", StringComparison.OrdinalIgnoreCase))
             {
-                return "HELP/STATUS/READ/SET supported for AI4, DIO4, DO8, DI8.";
+                return "HELP | STATUS (passive) | STATUS PROBE | RESET CONNECTIONS | READ/SET AI4 DO8 DIO4 DI8";
             }
 
             if (p[0].Equals("STATUS", StringComparison.OrdinalIgnoreCase))
             {
-                return $"AI4={(_isAi4Connected?"OK":"DISCONNECTED")} DO8={(_isDo8Connected?"OK":"DISCONNECTED")} DIO4={(_isDio4Connected?"OK":"DISCONNECTED")} DI8={(_isDi8Connected?"OK":"DISCONNECTED")} | TCP_SERVER={(_tcpServerRunning ? $"{TcpBindIp}:{TcpPort}" : "OFF")}";
+                if (p.Length >= 2 && p[1].Equals("PROBE", StringComparison.OrdinalIgnoreCase))
+                {
+                    return ProbeStatusFromOpta();
+                }
+
+                return $"AI4={(_isAi4Connected ? "OK" : "DISCONNECTED")} DO8={(_isDo8Connected ? "OK" : "DISCONNECTED")} DIO4={(_isDio4Connected ? "OK" : "DISCONNECTED")} DI8={(_isDi8Connected ? "OK" : "DISCONNECTED")}";
             }
 
-            if (p.Length < 3) return "ERR Invalid command";
+            if (p.Length >= 2 && p[0].Equals("RESET", StringComparison.OrdinalIgnoreCase) && p[1].Equals("CONNECTIONS", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!SendOptaCommand("RESET CONNECTIONS", out var resetRsp)) return "ERR OPTA CONNECT FAILED";
+                return resetRsp;
+            }
 
-            var action = p[0].ToUpperInvariant();
+            if (p.Length < 2) return "ERR Invalid command";
+
+            var verb = p[0].ToUpperInvariant();
             var dev = p[1].ToUpperInvariant();
-
-            return dev switch
+            if ((verb != "READ" && verb != "SET") || (dev != "AI4" && dev != "DO8" && dev != "DIO4" && dev != "DI8"))
             {
-                "AI4" => HandleAi4(action, p),
-                "DO8" => HandleDo8(action, p),
-                "DIO4" => HandleDio4(action, p),
-                "DI8" => HandleDi8(action, p),
-                _ => "ERR Unknown device"
-            };
-        }
-
-        private string HandleAi4(string action, string[] p)
-        {
-            if (action == "READ")
-            {
-                if (p[2].Equals("ALL", StringComparison.OrdinalIgnoreCase))
-                {
-                    var sb = new StringBuilder();
-                    for (var i = 0; i < 8; i++) sb.Append($"CH{i}={FormatAiValue(i)} ");
-                    return sb.ToString().Trim();
-                }
-
-                if (TryParseChannel(p[2], out var readCh, 8))
-                {
-                    return $"CH{readCh}: raw={_aiRaw[readCh]}, type=0x{_aiType[readCh]:X4}, value={FormatAiValue(readCh)}";
-                }
-                return "ERR AI4 channel";
+                return "ERR Unknown command";
             }
 
-            if (action == "SET")
+            if (!SendOptaCommand(cmd, out var response))
             {
-                if (p.Length >= 4 && p[2].Equals("TYPE", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (!TryParseType(p[3], out var globalType)) return "ERR TYPE format";
-                    for (var i = 0; i < 8; i++) _aiType[i] = globalType;
-                    return $"OK AI4 TYPE=0x{globalType:X4}";
-                }
-
-                if (p.Length >= 5 && TryParseChannel(p[2], out var setCh, 8) && p[3].Equals("TYPE", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (!TryParseType(p[4], out var channelType)) return "ERR TYPE format";
-                    _aiType[setCh] = channelType;
-                    return $"OK AI4 CH{setCh} TYPE=0x{channelType:X4}";
-                }
+                return "ERR OPTA CONNECT FAILED";
             }
 
-            return "ERR AI4 command";
-        }
-
-        private string HandleDo8(string action, string[] p)
-        {
-            if (action == "READ")
-            {
-                if (TryParseChannel(p[2], out var readCh, 8)) return $"DO8 CH{readCh}={(_do8[readCh] ? "ON" : "OFF")}";
-                if (p[2].Equals("POWERON", StringComparison.OrdinalIgnoreCase)) return $"DO8 POWERON={_do8PowerOn}";
-                if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase)) return $"DO8 ACTIVE={_do8Active}";
-            }
-
-            if (action == "SET")
-            {
-                if (TryParseChannel(p[2], out var setCh, 8) && p.Length >= 4)
-                {
-                    var on = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
-                    ModbusWriteSingleCoil(Do8Ip, 1, (ushort)(256 + setCh), on);
-                    _do8[setCh] = on;
-                    return $"OK DO8 CH{setCh}={(_do8[setCh] ? "ON" : "OFF")}";
-                }
-
-                if (p[2].Equals("POWERON", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var pw))
-                {
-                    ModbusWriteSingleRegister(Do8Ip, 1, 257, (ushort)pw);
-                    _do8PowerOn = pw;
-                    return $"OK DO8 POWERON={pw}";
-                }
-
-                if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
-                {
-                    ModbusWriteSingleRegister(Do8Ip, 1, 385, (ushort)av);
-                    _do8Active = av;
-                    return $"OK DO8 ACTIVE={av}";
-                }
-            }
-
-            return "ERR DO8 command";
-        }
-
-        private string HandleDio4(string action, string[] p)
-        {
-            if (action == "READ")
-            {
-                if (p[2].StartsWith("DI") && TryParseIndexAfterPrefix(p[2], "DI", out var di, 4)) return $"DIO4 DI{di}={(_dio4Di[di] ? 1 : 0)}";
-                if (p[2].Equals("COUNT", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var countCh, 4)) return $"DIO4 COUNT CH{countCh}={_dio4Count[countCh]}";
-                if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase)) return $"DIO4 ACTIVE={_dio4Active}";
-                if (p[2].StartsWith("DO") && TryParseIndexAfterPrefix(p[2], "DO", out var dout, 4)) return $"DIO4 DO{dout}={(_dio4Do[dout] ? "ON" : "OFF")}";
-            }
-
-            if (action == "SET")
-            {
-                if (p[2].Equals("CLEAR", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var clearCh, 4))
-                {
-                    ModbusWriteSingleCoil(Dio4Ip, 1, (ushort)(144 + clearCh), true);
-                    ModbusWriteSingleCoil(Dio4Ip, 1, (ushort)(144 + clearCh), false);
-                    _dio4Count[clearCh] = 0;
-                    return $"OK DIO4 COUNT CH{clearCh} CLEARED";
-                }
-
-                if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
-                {
-                    ModbusWriteSingleRegister(Dio4Ip, 1, 129, (ushort)av);
-                    _dio4Active = av;
-                    return $"OK DIO4 ACTIVE={av}";
-                }
-
-                if (p[2].StartsWith("DO") && TryParseIndexAfterPrefix(p[2], "DO", out var dout, 4) && p.Length >= 4)
-                {
-                    var on = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
-                    ModbusWriteSingleCoil(Dio4Ip, 1, (ushort)(256 + dout), on);
-                    _dio4Do[dout] = on;
-                    return $"OK DIO4 DO{dout}={(_dio4Do[dout] ? "ON" : "OFF")}";
-                }
-            }
-
-            return "ERR DIO4 command";
-        }
-
-        private string HandleDi8(string action, string[] p)
-        {
-            if (!_isDi8Connected) return "ERR DI8 DISCONNECTED";
-            if (action == "READ")
-            {
-                if (TryParseChannel(p[2], out var readCh, 8)) return $"DI8 CH{readCh}={(_di8[readCh] ? 1 : 0)}";
-                if (p[2].Equals("COUNT", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var countCh, 8)) return $"DI8 COUNT CH{countCh}={_di8Count[countCh]}";
-                if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase)) return $"DI8 ACTIVE={_di8Active}";
-            }
-
-            if (action == "SET")
-            {
-                if (p[2].Equals("CLEAR", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var clearCh, 8))
-                {
-                    ModbusWriteSingleCoil(Di8Ip, 1, (ushort)(144 + clearCh), true);
-                    ModbusWriteSingleCoil(Di8Ip, 1, (ushort)(144 + clearCh), false);
-                    _di8Count[clearCh] = 0;
-                    return $"OK DI8 COUNT CH{clearCh} CLEARED";
-                }
-
-                if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
-                {
-                    ModbusWriteSingleRegister(Di8Ip, 1, 129, (ushort)av);
-                    _di8Active = av;
-                    return $"OK DI8 ACTIVE={av}";
-                }
-            }
-
-            return "ERR DI8 command";
+            UpdateStateFromResponse(cmd, response);
+            return response;
         }
 
         private void InitializeDemoState()
@@ -545,6 +406,7 @@ namespace OPTA_ModbusDemo
             {
                 _aiRaw[i] = 0;
                 _aiType[i] = 0x0103;
+                _aiValueText[i] = "N/A";
                 _do8[i] = false;
                 _di8[i] = false;
                 _di8Count[i] = 0;
@@ -649,34 +511,7 @@ namespace OPTA_ModbusDemo
         private string FormatAiValue(int ch)
         {
             if (!_isAi4Connected) return "DISCONNECTED";
-            var type = _aiType[ch];
-            var isDiff = IsDifferentialType(type);
-
-            if (isDiff && ch % 2 == 1)
-            {
-                return $"N/A (paired with CH{ch - 1})";
-            }
-
-            var raw = isDiff ? Math.Max(0, _aiRaw[ch - ch % 2] - _aiRaw[ch - ch % 2 + 1]) : _aiRaw[ch];
-            var fs = 16_777_215d;
-
-            return type switch
-            {
-                0x0101 => $"{(10d / fs * raw):0.###} V",
-                0x0102 => $"{(5d / fs * raw):0.###} V",
-                0x0103 => $"{(1d / fs * raw):0.###} V",
-                0x0104 => $"{(0.5d / fs * raw):0.###} V",
-                0x0105 => $"{(0.1d / fs * raw):0.###} V",
-                0x0106 => $"{(20d / fs * raw - 10):0.###} V",
-                0x0107 => $"{(10d / fs * raw - 5):0.###} V",
-                0x0108 => $"{(2d / fs * raw - 1):0.###} V",
-                0x0109 => $"{(1d / fs * raw - 0.5):0.###} V",
-                0x010A => $"{(0.2d / fs * raw - 0.1):0.###} V",
-                0x0201 => $"{(16d / fs * raw + 4):0.###} mA",
-                0x0202 => $"{(20d / fs * raw):0.###} mA",
-                0x0203 => $"{(40d / fs * raw - 20):0.###} mA",
-                _ => "Unknown"
-            };
+            return _aiValueText[ch];
         }
 
         private static bool TryParseType(string token, out ushort type)
@@ -785,327 +620,214 @@ namespace OPTA_ModbusDemo
 
         private bool PollAi4()
         {
-            try
+            var ok = true;
+            for (var ch = 0; ch < 8; ch++)
             {
-                var regs = ModbusReadInputRegisters(Ai4Ip, 1, 0, 16);
-                if (regs.Length < 16) return false;
-                for (var i = 0; i < 8; i++)
+                if (!SendOptaCommand($"READ AI4 CH{ch}", out var valRsp))
                 {
-                    _aiRaw[i] = (regs[i * 2] << 16) | regs[i * 2 + 1];
+                    ok = false;
+                    continue;
                 }
-                return true;
+
+                _aiValueText[ch] = TryExtractValueText(valRsp, out var valueText) ? valueText : valRsp;
+                if (TryExtractType(valRsp, out var type)) _aiType[ch] = type;
+
+                if (SendOptaCommand($"READ AI4 RAW CH{ch}", out var rawRsp) && TryExtractLastInt(rawRsp, out var raw))
+                {
+                    _aiRaw[ch] = raw;
+                }
+                else
+                {
+                    ok = false;
+                }
             }
-            catch
-            {
-                return false;
-            }
+
+            return ok;
         }
 
         private bool PollDo8()
         {
-            try
+            var ok = true;
+            for (var ch = 0; ch < 8; ch++)
             {
-                var coils = ModbusReadCoils(Do8Ip, 1, 256, 8);
-                for (var i = 0; i < 8 && i < coils.Length; i++) _do8[i] = coils[i];
-                return true;
+                if (!SendOptaCommand($"READ DO8 CH{ch}", out var rsp))
+                {
+                    ok = false;
+                    continue;
+                }
+
+                if (TryExtractOnOff(rsp, out var isOn)) _do8[ch] = isOn;
             }
-            catch
-            {
-                return false;
-            }
+
+            if (SendOptaCommand("READ DO8 POWERON", out var powerRsp) && TryExtractLastInt(powerRsp, out var powerVal)) _do8PowerOn = powerVal;
+            if (SendOptaCommand("READ DO8 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _do8Active = activeVal;
+            return ok;
         }
 
         private bool PollDio4()
         {
-            try
+            var ok = true;
+            for (var ch = 0; ch < 4; ch++)
             {
-                var di = ModbusReadCoils(Dio4Ip, 1, 0, 4);
-                var counts = ModbusReadInputRegisters(Dio4Ip, 1, 0, 4);
-                for (var i = 0; i < 4; i++)
-                {
-                    _dio4Di[i] = di[i];
-                    _dio4Count[i] = counts[i];
-                }
-                // DO outputs use same map style as DO8 channels 0~3 -> 256~259
-                var dOut = ModbusReadCoils(Dio4Ip, 1, 256, 4);
-                for (var i = 0; i < 4; i++) _dio4Do[i] = dOut[i];
-                return true;
+                if (SendOptaCommand($"READ DIO4 DI{ch}", out var diRsp) && TryExtractLastInt(diRsp, out var diVal))
+                    _dio4Di[ch] = diVal != 0;
+                else
+                    ok = false;
+
+                if (SendOptaCommand($"READ DIO4 COUNT CH{ch}", out var cntRsp) && TryExtractLastInt(cntRsp, out var cntVal))
+                    _dio4Count[ch] = cntVal;
+                else
+                    ok = false;
+
+                if (SendOptaCommand($"READ DIO4 DO{ch}", out var doRsp) && TryExtractOnOff(doRsp, out var doVal))
+                    _dio4Do[ch] = doVal;
+                else
+                    ok = false;
             }
-            catch
-            {
-                return false;
-            }
+
+            if (SendOptaCommand("READ DIO4 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _dio4Active = activeVal;
+            return ok;
         }
 
         private bool PollDi8()
         {
-            try
+            var ok = true;
+            for (var ch = 0; ch < 8; ch++)
             {
-                var di = ModbusReadCoils(Di8Ip, 1, 0, 8);
-                var counts = ModbusReadInputRegisters(Di8Ip, 1, 0, 8);
-                for (var i = 0; i < 8; i++)
-                {
-                    _di8[i] = di[i];
-                    _di8Count[i] = counts[i];
-                }
-                return true;
+                if (SendOptaCommand($"READ DI8 CH{ch}", out var diRsp) && TryExtractLastInt(diRsp, out var diVal))
+                    _di8[ch] = diVal != 0;
+                else
+                    ok = false;
+
+                if (SendOptaCommand($"READ DI8 COUNT CH{ch}", out var cntRsp) && TryExtractLastInt(cntRsp, out var cntVal))
+                    _di8Count[ch] = cntVal;
+                else
+                    ok = false;
             }
-            catch
+
+            if (SendOptaCommand("READ DI8 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _di8Active = activeVal;
+            return ok;
+        }
+
+        private string ProbeStatusFromOpta()
+        {
+            if (!SendOptaCommand("STATUS PROBE", out var rsp)) return "ERR OPTA CONNECT FAILED";
+
+            _isAi4Connected = TryExtractDeviceStatus(rsp, "AI4", _isAi4Connected);
+            _isDo8Connected = TryExtractDeviceStatus(rsp, "DO8", _isDo8Connected);
+            _isDio4Connected = TryExtractDeviceStatus(rsp, "DIO4", _isDio4Connected);
+            _isDi8Connected = TryExtractDeviceStatus(rsp, "DI8", _isDi8Connected);
+            return rsp;
+        }
+
+        private void UpdateStateFromResponse(string command, string response)
+        {
+            var upper = command.ToUpperInvariant();
+            if (upper.StartsWith("SET AI4 TYPE ") && TryParseType(command[(command.LastIndexOf(' ') + 1)..], out var globalType))
             {
-                return false;
+                for (var i = 0; i < 8; i++) _aiType[i] = globalType;
+                return;
             }
-        }
 
-        private static ushort[] ModbusReadInputRegisters(string ip, byte unitId, ushort start, ushort count)
-        {
-            return ModbusReadRegisters(ip, unitId, 4, start, count);
-        }
-
-        private static ushort[] ModbusReadHoldingRegisters(string ip, byte unitId, ushort start, ushort count)
-        {
-            return ModbusReadRegisters(ip, unitId, 3, start, count);
-        }
-
-        private static ushort[] ModbusReadRegisters(string ip, byte unitId, byte function, ushort start, ushort count)
-        {
-            var pdu = new byte[5];
-            pdu[0] = function;
-            pdu[1] = (byte)(start >> 8);
-            pdu[2] = (byte)(start & 0xFF);
-            pdu[3] = (byte)(count >> 8);
-            pdu[4] = (byte)(count & 0xFF);
-            var resp = ModbusSend(ip, unitId, pdu);
-            if (resp.Length < 2 || resp[0] != function) throw new IOException("Invalid Modbus response");
-            var byteCount = resp[1];
-            if (resp.Length < 2 + byteCount) throw new IOException("Short Modbus response");
-            var regs = new ushort[byteCount / 2];
-            for (var i = 0; i < regs.Length; i++) regs[i] = (ushort)((resp[2 + i * 2] << 8) | resp[3 + i * 2]);
-            return regs;
-        }
-
-        private static bool[] ModbusReadCoils(string ip, byte unitId, ushort start, ushort count)
-        {
-            var pdu = new byte[5];
-            pdu[0] = 1;
-            pdu[1] = (byte)(start >> 8);
-            pdu[2] = (byte)(start & 0xFF);
-            pdu[3] = (byte)(count >> 8);
-            pdu[4] = (byte)(count & 0xFF);
-            var resp = ModbusSend(ip, unitId, pdu);
-            if (resp.Length < 2 || resp[0] != 1) throw new IOException("Invalid Modbus response");
-            var byteCount = resp[1];
-            if (resp.Length < 2 + byteCount) throw new IOException("Short Modbus response");
-            var result = new bool[count];
-            for (var i = 0; i < count; i++)
+            if (upper.StartsWith("SET AI4 CH") && TryParseChannel(command.Split(' ', StringSplitOptions.RemoveEmptyEntries)[2], out var ch, 8) && TryExtractType(response, out var type))
             {
-                result[i] = (resp[2 + i / 8] & (1 << (i % 8))) != 0;
-            }
-            return result;
-        }
-
-        private static void ModbusWriteSingleCoil(string ip, byte unitId, ushort address, bool value)
-        {
-            var pdu = new byte[5];
-            pdu[0] = 5;
-            pdu[1] = (byte)(address >> 8);
-            pdu[2] = (byte)(address & 0xFF);
-            pdu[3] = value ? (byte)0xFF : (byte)0x00;
-            pdu[4] = 0x00;
-            var resp = ModbusSend(ip, unitId, pdu);
-            if (resp.Length < 5 || resp[0] != 5) throw new IOException("Write coil failed");
-        }
-
-        private static void ModbusWriteSingleRegister(string ip, byte unitId, ushort address, ushort value)
-        {
-            var pdu = new byte[5];
-            pdu[0] = 6;
-            pdu[1] = (byte)(address >> 8);
-            pdu[2] = (byte)(address & 0xFF);
-            pdu[3] = (byte)(value >> 8);
-            pdu[4] = (byte)(value & 0xFF);
-            var resp = ModbusSend(ip, unitId, pdu);
-            if (resp.Length < 5 || resp[0] != 6) throw new IOException("Write register failed");
-        }
-
-        private static byte[] ModbusSend(string ip, byte unitId, byte[] pdu)
-        {
-            using var client = new TcpClient();
-            client.ReceiveTimeout = 500;
-            client.SendTimeout = 500;
-            var connectTask = client.ConnectAsync(ip, 502);
-            if (!connectTask.Wait(500))
-            {
-                throw new IOException($"Connect timeout to {ip}:502");
-            }
-            using var stream = client.GetStream();
-
-            var tid = (ushort)Environment.TickCount;
-            var mbap = new byte[7];
-            mbap[0] = (byte)(tid >> 8);
-            mbap[1] = (byte)(tid & 0xFF);
-            mbap[2] = 0;
-            mbap[3] = 0;
-            mbap[4] = 0;
-            mbap[5] = (byte)(pdu.Length + 1);
-            mbap[6] = unitId;
-
-            stream.Write(mbap, 0, mbap.Length);
-            stream.Write(pdu, 0, pdu.Length);
-
-            var header = ReadExact(stream, 7);
-            var len = (header[4] << 8) | header[5];
-            var body = ReadExact(stream, len - 1);
-            return body;
-        }
-
-        private static byte[] ReadExact(Stream stream, int count)
-        {
-            var buf = new byte[count];
-            var read = 0;
-            while (read < count)
-            {
-                var r = stream.Read(buf, read, count - read);
-                if (r <= 0) throw new IOException("Socket closed");
-                read += r;
-            }
-            return buf;
-        }
-
-        private void StartTcpServer()
-        {
-            try
-            {
-                _tcpCts = new CancellationTokenSource();
-                if (!IPAddress.TryParse(TcpBindIp, out var bindAddress))
-                {
-                    throw new InvalidOperationException($"Invalid bind IP: {TcpBindIp}");
-                }
-                _tcpListener = new TcpListener(bindAddress, TcpPort);
-                _tcpListener.Start();
-                _tcpServerRunning = true;
-                AppendConsole($"TCP Server listening on {TcpBindIp}:{TcpPort}", "NET");
-                _ = Task.Run(() => AcceptLoopAsync(_tcpCts.Token));
-            }
-            catch (Exception ex)
-            {
-                _tcpServerRunning = false;
-                AppendConsole($"TCP Server start failed: {ex.Message}", "ERR");
+                _aiType[ch] = type;
             }
         }
 
-        private void StopTcpServer()
+        private bool SendOptaCommand(string cmd, out string response)
         {
-            try
+            response = string.Empty;
+            lock (_optaIoSync)
             {
-                _tcpCts?.Cancel();
-                _tcpListener?.Stop();
-            }
-            catch
-            {
-                // ignore shutdown exceptions
-            }
-            finally
-            {
-                _tcpServerRunning = false;
-            }
-        }
-
-        private async Task AcceptLoopAsync(CancellationToken ct)
-        {
-            if (_tcpListener == null) return;
-
-            while (!ct.IsCancellationRequested)
-            {
-                TcpClient? client = null;
                 try
                 {
-                    client = await _tcpListener.AcceptTcpClientAsync(ct);
-                    _ = Task.Run(() => HandleClientAsync(client, ct), ct);
+                    using var client = new TcpClient();
+                    client.ReceiveTimeout = 1200;
+                    client.SendTimeout = 1200;
+                    var connectTask = client.ConnectAsync(OptaIp, OptaTcpPort);
+                    if (!connectTask.Wait(1200)) return false;
+
+                    using var stream = client.GetStream();
+                    using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
+                    using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true)
+                    {
+                        AutoFlush = true,
+                        NewLine = "\n"
+                    };
+
+                    _ = reader.ReadLine();
+                    writer.WriteLine(cmd);
+                    response = reader.ReadLine() ?? string.Empty;
+                    return !string.IsNullOrWhiteSpace(response);
                 }
-                catch (OperationCanceledException)
+                catch
                 {
-                    break;
-                }
-                catch (ObjectDisposedException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    BeginInvoke(new Action(() => AppendConsole($"Accept failed: {ex.Message}", "ERR")));
-                    client?.Dispose();
+                    return false;
                 }
             }
         }
 
-        private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+        private static bool TryExtractType(string text, out ushort type)
         {
-            var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-            BeginInvoke(new Action(() => AppendConsole($"Client connected: {endpoint}", "NET")));
-
-            try
+            var m = Regex.Match(text, @"0x([0-9A-Fa-f]{4})");
+            if (!m.Success)
             {
-                await using var stream = client.GetStream();
-                using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
-                await using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true)
-                {
-                    AutoFlush = true,
-                    NewLine = "\n"
-                };
-
-                await writer.WriteLineAsync("Opta Modbus Demo TCP ready. Type HELP.");
-
-                while (!ct.IsCancellationRequested)
-                {
-                    var line = await reader.ReadLineAsync();
-                    if (line == null) break;
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-
-                    string response = string.Empty;
-                    await InvokeAsync(() =>
-                    {
-                        AppendConsole($">(TCP:{endpoint}) {line}", "CMD");
-                        response = ExecuteCommand(line.Trim());
-                        AppendConsole(response, "RSP");
-                        RefreshAllViews();
-                    });
-
-                    await writer.WriteLineAsync(response);
-                }
+                type = 0;
+                return false;
             }
-            catch (Exception ex)
-            {
-                BeginInvoke(new Action(() => AppendConsole($"Client error ({endpoint}): {ex.Message}", "ERR")));
-            }
-            finally
-            {
-                client.Dispose();
-                BeginInvoke(new Action(() => AppendConsole($"Client disconnected: {endpoint}", "NET")));
-            }
+
+            return ushort.TryParse(m.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out type);
         }
 
-        private Task InvokeAsync(Action action)
+        private static bool TryExtractLastInt(string text, out int value)
         {
-            if (InvokeRequired)
+            var matches = Regex.Matches(text, @"-?\d+");
+            if (matches.Count == 0)
             {
-                var tcs = new TaskCompletionSource<object?>();
-                BeginInvoke(new Action(() =>
-                {
-                    try
-                    {
-                        action();
-                        tcs.SetResult(null);
-                    }
-                    catch (Exception ex)
-                    {
-                        tcs.SetException(ex);
-                    }
-                }));
-                return tcs.Task;
+                value = 0;
+                return false;
             }
 
-            action();
-            return Task.CompletedTask;
+            return int.TryParse(matches[^1].Value, out value);
+        }
+
+        private static bool TryExtractOnOff(string text, out bool on)
+        {
+            if (text.Contains("ON", StringComparison.OrdinalIgnoreCase))
+            {
+                on = true;
+                return true;
+            }
+
+            if (text.Contains("OFF", StringComparison.OrdinalIgnoreCase))
+            {
+                on = false;
+                return true;
+            }
+
+            on = false;
+            return false;
+        }
+
+        private static bool TryExtractValueText(string text, out string value)
+        {
+            var idx = text.IndexOf("value=", StringComparison.OrdinalIgnoreCase);
+            if (idx < 0)
+            {
+                value = string.Empty;
+                return false;
+            }
+
+            value = text[(idx + 6)..].Trim();
+            return true;
+        }
+
+        private static bool TryExtractDeviceStatus(string text, string device, bool fallback)
+        {
+            var m = Regex.Match(text, $@"\b{device}\s*=\s*(OK|DISCONNECTED|FAIL)\b", RegexOptions.IgnoreCase);
+            if (!m.Success) return fallback;
+            return m.Groups[1].Value.Equals("OK", StringComparison.OrdinalIgnoreCase);
         }
 
         private void AppendConsole(string message, string level)
