@@ -1,4 +1,7 @@
 using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 
 namespace OPTA_ModbusDemo
@@ -46,7 +49,28 @@ namespace OPTA_ModbusDemo
         private int _di8Active = 1;
 
         private readonly System.Windows.Forms.Timer _refreshTimer = new();
-        private readonly Random _rnd = new(42);
+
+        private bool _isAi4Connected;
+        private bool _isDo8Connected;
+        private bool _isDio4Connected;
+        private bool _isDi8Connected;
+
+        private const string OptaIp = "192.168.2.100";
+        private const string Ai4Ip = "192.168.2.111";
+        private const string Do8Ip = "192.168.2.112";
+        private const string Dio4Ip = "192.168.2.113";
+        private const string Di8Ip = "192.168.2.114";
+
+        private readonly Label _lblAi4Status = new();
+        private readonly Label _lblDo8Status = new();
+        private readonly Label _lblDio4Status = new();
+        private readonly Label _lblDi8Status = new();
+
+        private TcpListener? _tcpListener;
+        private CancellationTokenSource? _tcpCts;
+        private bool _tcpServerRunning;
+        private const int TcpPort = 5000;
+        private const string TcpBindIp = OptaIp;
 
         public Form1()
         {
@@ -54,8 +78,11 @@ namespace OPTA_ModbusDemo
             BuildLayout();
             InitializeDemoState();
             ConfigureRefreshTimer();
+            StartTcpServer();
+            PollAllDevices();
             RefreshAllViews();
             AppendConsole("系統啟動完成。輸入 HELP 查看指令。", "INFO");
+            FormClosing += (_, _) => StopTcpServer();
         }
 
         private void ConfigureRefreshTimer()
@@ -63,34 +90,10 @@ namespace OPTA_ModbusDemo
             _refreshTimer.Interval = 500;
             _refreshTimer.Tick += (_, _) =>
             {
-                SimulateInputUpdate();
+                PollAllDevices();
                 RefreshAllViews();
             };
             _refreshTimer.Start();
-        }
-
-        private void SimulateInputUpdate()
-        {
-            for (var i = 0; i < 8; i++)
-            {
-                var delta = _rnd.Next(-180000, 180001);
-                _aiRaw[i] = Math.Clamp(_aiRaw[i] + delta, 0, 16_777_215);
-
-                if (_rnd.NextDouble() < 0.15)
-                {
-                    _di8[i] = !_di8[i];
-                }
-                if (_di8[i]) _di8Count[i] += _rnd.Next(0, 5);
-            }
-
-            for (var i = 0; i < 4; i++)
-            {
-                if (_rnd.NextDouble() < 0.2)
-                {
-                    _dio4Di[i] = !_dio4Di[i];
-                }
-                if (_dio4Di[i]) _dio4Count[i] += _rnd.Next(0, 4);
-            }
         }
 
         private void BuildLayout()
@@ -105,7 +108,7 @@ namespace OPTA_ModbusDemo
             _lblHeader.AutoSize = true;
             _lblHeader.Location = new Point(16, 12);
 
-            _lblSubHeader.Text = "Opta 192.168.2.100:5000｜AI4(111) DO8(112) DIO4(113) DI8(114)｜輸入每 0.5 秒更新";
+            _lblSubHeader.Text = $"Opta {OptaIp}:5000｜AI4(111) DO8(112) DIO4(113) DI8(114)";
             _lblSubHeader.ForeColor = Color.DimGray;
             _lblSubHeader.AutoSize = true;
             _lblSubHeader.Location = new Point(18, 44);
@@ -124,8 +127,13 @@ namespace OPTA_ModbusDemo
             BuildDo8Tab(do8Page);
             BuildDi8Tab(di8Page);
             BuildConsolePanel();
+            var statusY = 46;
+            SetupStatusLabel(_lblAi4Status, "AI4", 760, statusY);
+            SetupStatusLabel(_lblDo8Status, "DO8", 880, statusY);
+            SetupStatusLabel(_lblDio4Status, "DIO4", 1000, statusY);
+            SetupStatusLabel(_lblDi8Status, "DI8", 1120, statusY);
 
-            Controls.AddRange([_lblHeader, _lblSubHeader, _tabDevices, _txtConsole, _txtCommand]);
+            Controls.AddRange([_lblHeader, _lblSubHeader, _tabDevices, _txtConsole, _txtCommand, _lblAi4Status, _lblDo8Status, _lblDio4Status, _lblDi8Status]);
         }
 
         private void BuildAiTab(TabPage page)
@@ -215,9 +223,8 @@ namespace OPTA_ModbusDemo
                 var chIndex = i;
                 var y = 30 + chIndex * 46;
                 grp.Controls.Add(new Label { Text = $"CH{chIndex}", Location = new Point(12, y + 7), AutoSize = true });
-                _dio4DiToggleButtons[chIndex] = MakeButton("Toggle DI", 70, y, () =>
+                _dio4DiToggleButtons[chIndex] = MakeButton("READ DI", 70, y, () =>
                 {
-                    _dio4Di[chIndex] = !_dio4Di[chIndex];
                     ExecuteAndEcho($"READ DIO4 DI{chIndex}");
                 }, 100, 30);
                 var clear = MakeButton("Clear Count", 176, y, () => ExecuteAndEcho($"SET DIO4 CLEAR CH{chIndex}"), 110, 30);
@@ -297,9 +304,8 @@ namespace OPTA_ModbusDemo
                 var x = 16 + col * 250;
                 var y = 34 + row * 62;
                 grp.Controls.Add(new Label { Text = $"CH{chIndex}", Location = new Point(x, y + 8), AutoSize = true });
-                _di8DiToggleButtons[chIndex] = MakeButton("Toggle DI", x + 46, y + 2, () =>
+                _di8DiToggleButtons[chIndex] = MakeButton("READ DI", x + 46, y + 2, () =>
                 {
-                    _di8[chIndex] = !_di8[chIndex];
                     ExecuteAndEcho($"READ DI8 CH{chIndex}");
                 }, 94, 32);
                 var clear = MakeButton("Clear", x + 146, y + 2, () => ExecuteAndEcho($"SET DI8 CLEAR CH{chIndex}"), 80, 32);
@@ -369,7 +375,7 @@ namespace OPTA_ModbusDemo
 
             if (p[0].Equals("STATUS", StringComparison.OrdinalIgnoreCase))
             {
-                return $"AI4=OK DO8=OK DIO4=OK DI8=OK | DO8_ACTIVE={_do8Active} DIO4_ACTIVE={_dio4Active} DI8_ACTIVE={_di8Active}";
+                return $"AI4={(_isAi4Connected?"OK":"DISCONNECTED")} DO8={(_isDo8Connected?"OK":"DISCONNECTED")} DIO4={(_isDio4Connected?"OK":"DISCONNECTED")} DI8={(_isDi8Connected?"OK":"DISCONNECTED")} | TCP_SERVER={(_tcpServerRunning ? $"{TcpBindIp}:{TcpPort}" : "OFF")}";
             }
 
             if (p.Length < 3) return "ERR Invalid command";
@@ -438,18 +444,22 @@ namespace OPTA_ModbusDemo
             {
                 if (TryParseChannel(p[2], out var setCh, 8) && p.Length >= 4)
                 {
-                    _do8[setCh] = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
+                    var on = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
+                    ModbusWriteSingleCoil(Do8Ip, 1, (ushort)(256 + setCh), on);
+                    _do8[setCh] = on;
                     return $"OK DO8 CH{setCh}={(_do8[setCh] ? "ON" : "OFF")}";
                 }
 
                 if (p[2].Equals("POWERON", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var pw))
                 {
+                    ModbusWriteSingleRegister(Do8Ip, 1, 257, (ushort)pw);
                     _do8PowerOn = pw;
                     return $"OK DO8 POWERON={pw}";
                 }
 
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
                 {
+                    ModbusWriteSingleRegister(Do8Ip, 1, 385, (ushort)av);
                     _do8Active = av;
                     return $"OK DO8 ACTIVE={av}";
                 }
@@ -472,19 +482,24 @@ namespace OPTA_ModbusDemo
             {
                 if (p[2].Equals("CLEAR", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var clearCh, 4))
                 {
+                    ModbusWriteSingleCoil(Dio4Ip, 1, (ushort)(144 + clearCh), true);
+                    ModbusWriteSingleCoil(Dio4Ip, 1, (ushort)(144 + clearCh), false);
                     _dio4Count[clearCh] = 0;
                     return $"OK DIO4 COUNT CH{clearCh} CLEARED";
                 }
 
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
                 {
+                    ModbusWriteSingleRegister(Dio4Ip, 1, 129, (ushort)av);
                     _dio4Active = av;
                     return $"OK DIO4 ACTIVE={av}";
                 }
 
                 if (p[2].StartsWith("DO") && TryParseIndexAfterPrefix(p[2], "DO", out var dout, 4) && p.Length >= 4)
                 {
-                    _dio4Do[dout] = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
+                    var on = p[3].Equals("ON", StringComparison.OrdinalIgnoreCase);
+                    ModbusWriteSingleCoil(Dio4Ip, 1, (ushort)(256 + dout), on);
+                    _dio4Do[dout] = on;
                     return $"OK DIO4 DO{dout}={(_dio4Do[dout] ? "ON" : "OFF")}";
                 }
             }
@@ -494,6 +509,7 @@ namespace OPTA_ModbusDemo
 
         private string HandleDi8(string action, string[] p)
         {
+            if (!_isDi8Connected) return "ERR DI8 DISCONNECTED";
             if (action == "READ")
             {
                 if (TryParseChannel(p[2], out var readCh, 8)) return $"DI8 CH{readCh}={(_di8[readCh] ? 1 : 0)}";
@@ -505,12 +521,15 @@ namespace OPTA_ModbusDemo
             {
                 if (p[2].Equals("CLEAR", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && TryParseChannel(p[3], out var clearCh, 8))
                 {
+                    ModbusWriteSingleCoil(Di8Ip, 1, (ushort)(144 + clearCh), true);
+                    ModbusWriteSingleCoil(Di8Ip, 1, (ushort)(144 + clearCh), false);
                     _di8Count[clearCh] = 0;
                     return $"OK DI8 COUNT CH{clearCh} CLEARED";
                 }
 
                 if (p[2].Equals("ACTIVE", StringComparison.OrdinalIgnoreCase) && p.Length >= 4 && int.TryParse(p[3], out var av))
                 {
+                    ModbusWriteSingleRegister(Di8Ip, 1, 129, (ushort)av);
                     _di8Active = av;
                     return $"OK DI8 ACTIVE={av}";
                 }
@@ -523,18 +542,18 @@ namespace OPTA_ModbusDemo
         {
             for (var i = 0; i < 8; i++)
             {
-                _aiRaw[i] = _rnd.Next(3_000_000, 15_000_000);
+                _aiRaw[i] = 0;
                 _aiType[i] = 0x0103;
-                _do8[i] = i % 2 == 0;
-                _di8[i] = i % 3 == 0;
-                _di8Count[i] = _rnd.Next(0, 1000);
+                _do8[i] = false;
+                _di8[i] = false;
+                _di8Count[i] = 0;
             }
 
             for (var i = 0; i < 4; i++)
             {
-                _dio4Di[i] = i % 2 == 1;
-                _dio4Do[i] = i % 2 == 0;
-                _dio4Count[i] = _rnd.Next(0, 500);
+                _dio4Di[i] = false;
+                _dio4Do[i] = false;
+                _dio4Count[i] = 0;
             }
         }
 
@@ -555,7 +574,10 @@ namespace OPTA_ModbusDemo
                     _do8ToggleButtons[i].Text = $"Toggle ({(_do8[i] ? "ON" : "OFF")})";
 
                 if (_di8DiToggleButtons[i] != null)
-                    _di8DiToggleButtons[i].Text = $"Toggle DI ({(_di8[i] ? 1 : 0)})";
+                {
+                    _di8DiToggleButtons[i].Enabled = _isDi8Connected;
+                    _di8DiToggleButtons[i].Text = _isDi8Connected ? $"READ DI ({(_di8[i] ? 1 : 0)})" : "DI8 Offline";
+                }
 
             }
 
@@ -565,7 +587,7 @@ namespace OPTA_ModbusDemo
                     _dio4DoToggleButtons[i].Text = $"DO Toggle ({(_dio4Do[i] ? "ON" : "OFF")})";
 
                 if (_dio4DiToggleButtons[i] != null)
-                    _dio4DiToggleButtons[i].Text = $"Toggle DI ({(_dio4Di[i] ? 1 : 0)})";
+                    _dio4DiToggleButtons[i].Text = $"READ DI ({(_dio4Di[i] ? 1 : 0)})";
             }
         }
 
@@ -612,6 +634,11 @@ namespace OPTA_ModbusDemo
         private void RefreshDi8Grid()
         {
             _gridDi8.Rows.Clear();
+            if (!_isDi8Connected)
+            {
+                _gridDi8.Rows.Add("-", "DISCONNECTED", "-");
+                return;
+            }
             for (var i = 0; i < 8; i++)
             {
                 _gridDi8.Rows.Add($"CH{i}", _di8[i] ? "1" : "0", _di8Count[i]);
@@ -620,6 +647,7 @@ namespace OPTA_ModbusDemo
 
         private string FormatAiValue(int ch)
         {
+            if (!_isAi4Connected) return "DISCONNECTED";
             var type = _aiType[ch];
             var isDiff = IsDifferentialType(type);
 
@@ -676,6 +704,362 @@ namespace OPTA_ModbusDemo
             token = token.ToUpperInvariant();
             if (!token.StartsWith(prefix)) return false;
             return int.TryParse(token[prefix.Length..], out index) && index >= 0 && index < maxExclusive;
+        }
+
+        private void SetupStatusLabel(Label label, string deviceName, int x, int y)
+        {
+            label.AutoSize = false;
+            label.TextAlign = ContentAlignment.MiddleCenter;
+            label.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+            label.Location = new Point(x, y);
+            label.Size = new Size(110, 24);
+            label.Text = $"{deviceName}: CHECK";
+            label.BackColor = Color.DarkGray;
+            label.ForeColor = Color.White;
+        }
+
+        private void PollAllDevices()
+        {
+            _isAi4Connected = PollAi4();
+            _isDo8Connected = PollDo8();
+            _isDio4Connected = PollDio4();
+            _isDi8Connected = PollDi8();
+            UpdateStatusLabels();
+        }
+
+        private void UpdateStatusLabels()
+        {
+            SetStatus(_lblAi4Status, "AI4", _isAi4Connected);
+            SetStatus(_lblDo8Status, "DO8", _isDo8Connected);
+            SetStatus(_lblDio4Status, "DIO4", _isDio4Connected);
+            SetStatus(_lblDi8Status, "DI8", _isDi8Connected);
+        }
+
+        private static void SetStatus(Label label, string name, bool ok)
+        {
+            label.Text = ok ? $"{name}: OK" : $"{name}: FAIL";
+            label.BackColor = ok ? Color.ForestGreen : Color.Firebrick;
+        }
+
+        private bool PollAi4()
+        {
+            try
+            {
+                var regs = ModbusReadInputRegisters(Ai4Ip, 1, 0, 16);
+                if (regs.Length < 16) return false;
+                for (var i = 0; i < 8; i++)
+                {
+                    _aiRaw[i] = (regs[i * 2] << 16) | regs[i * 2 + 1];
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool PollDo8()
+        {
+            try
+            {
+                var coils = ModbusReadCoils(Do8Ip, 1, 256, 8);
+                for (var i = 0; i < 8 && i < coils.Length; i++) _do8[i] = coils[i];
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool PollDio4()
+        {
+            try
+            {
+                var di = ModbusReadCoils(Dio4Ip, 1, 0, 4);
+                var counts = ModbusReadInputRegisters(Dio4Ip, 1, 0, 4);
+                for (var i = 0; i < 4; i++)
+                {
+                    _dio4Di[i] = di[i];
+                    _dio4Count[i] = counts[i];
+                }
+                // DO outputs use same map style as DO8 channels 0~3 -> 256~259
+                var dOut = ModbusReadCoils(Dio4Ip, 1, 256, 4);
+                for (var i = 0; i < 4; i++) _dio4Do[i] = dOut[i];
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool PollDi8()
+        {
+            try
+            {
+                var di = ModbusReadCoils(Di8Ip, 1, 0, 8);
+                var counts = ModbusReadInputRegisters(Di8Ip, 1, 0, 8);
+                for (var i = 0; i < 8; i++)
+                {
+                    _di8[i] = di[i];
+                    _di8Count[i] = counts[i];
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static ushort[] ModbusReadInputRegisters(string ip, byte unitId, ushort start, ushort count)
+        {
+            return ModbusReadRegisters(ip, unitId, 4, start, count);
+        }
+
+        private static ushort[] ModbusReadHoldingRegisters(string ip, byte unitId, ushort start, ushort count)
+        {
+            return ModbusReadRegisters(ip, unitId, 3, start, count);
+        }
+
+        private static ushort[] ModbusReadRegisters(string ip, byte unitId, byte function, ushort start, ushort count)
+        {
+            var pdu = new byte[5];
+            pdu[0] = function;
+            pdu[1] = (byte)(start >> 8);
+            pdu[2] = (byte)(start & 0xFF);
+            pdu[3] = (byte)(count >> 8);
+            pdu[4] = (byte)(count & 0xFF);
+            var resp = ModbusSend(ip, unitId, pdu);
+            if (resp.Length < 2 || resp[0] != function) throw new IOException("Invalid Modbus response");
+            var byteCount = resp[1];
+            if (resp.Length < 2 + byteCount) throw new IOException("Short Modbus response");
+            var regs = new ushort[byteCount / 2];
+            for (var i = 0; i < regs.Length; i++) regs[i] = (ushort)((resp[2 + i * 2] << 8) | resp[3 + i * 2]);
+            return regs;
+        }
+
+        private static bool[] ModbusReadCoils(string ip, byte unitId, ushort start, ushort count)
+        {
+            var pdu = new byte[5];
+            pdu[0] = 1;
+            pdu[1] = (byte)(start >> 8);
+            pdu[2] = (byte)(start & 0xFF);
+            pdu[3] = (byte)(count >> 8);
+            pdu[4] = (byte)(count & 0xFF);
+            var resp = ModbusSend(ip, unitId, pdu);
+            if (resp.Length < 2 || resp[0] != 1) throw new IOException("Invalid Modbus response");
+            var byteCount = resp[1];
+            if (resp.Length < 2 + byteCount) throw new IOException("Short Modbus response");
+            var result = new bool[count];
+            for (var i = 0; i < count; i++)
+            {
+                result[i] = (resp[2 + i / 8] & (1 << (i % 8))) != 0;
+            }
+            return result;
+        }
+
+        private static void ModbusWriteSingleCoil(string ip, byte unitId, ushort address, bool value)
+        {
+            var pdu = new byte[5];
+            pdu[0] = 5;
+            pdu[1] = (byte)(address >> 8);
+            pdu[2] = (byte)(address & 0xFF);
+            pdu[3] = value ? (byte)0xFF : (byte)0x00;
+            pdu[4] = 0x00;
+            var resp = ModbusSend(ip, unitId, pdu);
+            if (resp.Length < 5 || resp[0] != 5) throw new IOException("Write coil failed");
+        }
+
+        private static void ModbusWriteSingleRegister(string ip, byte unitId, ushort address, ushort value)
+        {
+            var pdu = new byte[5];
+            pdu[0] = 6;
+            pdu[1] = (byte)(address >> 8);
+            pdu[2] = (byte)(address & 0xFF);
+            pdu[3] = (byte)(value >> 8);
+            pdu[4] = (byte)(value & 0xFF);
+            var resp = ModbusSend(ip, unitId, pdu);
+            if (resp.Length < 5 || resp[0] != 6) throw new IOException("Write register failed");
+        }
+
+        private static byte[] ModbusSend(string ip, byte unitId, byte[] pdu)
+        {
+            using var client = new TcpClient();
+            client.ReceiveTimeout = 800;
+            client.SendTimeout = 800;
+            client.Connect(ip, 502);
+            using var stream = client.GetStream();
+
+            var tid = (ushort)Environment.TickCount;
+            var mbap = new byte[7];
+            mbap[0] = (byte)(tid >> 8);
+            mbap[1] = (byte)(tid & 0xFF);
+            mbap[2] = 0;
+            mbap[3] = 0;
+            mbap[4] = 0;
+            mbap[5] = (byte)(pdu.Length + 1);
+            mbap[6] = unitId;
+
+            stream.Write(mbap, 0, mbap.Length);
+            stream.Write(pdu, 0, pdu.Length);
+
+            var header = ReadExact(stream, 7);
+            var len = (header[4] << 8) | header[5];
+            var body = ReadExact(stream, len - 1);
+            return body;
+        }
+
+        private static byte[] ReadExact(Stream stream, int count)
+        {
+            var buf = new byte[count];
+            var read = 0;
+            while (read < count)
+            {
+                var r = stream.Read(buf, read, count - read);
+                if (r <= 0) throw new IOException("Socket closed");
+                read += r;
+            }
+            return buf;
+        }
+
+        private void StartTcpServer()
+        {
+            try
+            {
+                _tcpCts = new CancellationTokenSource();
+                if (!IPAddress.TryParse(TcpBindIp, out var bindAddress))
+                {
+                    throw new InvalidOperationException($"Invalid bind IP: {TcpBindIp}");
+                }
+                _tcpListener = new TcpListener(bindAddress, TcpPort);
+                _tcpListener.Start();
+                _tcpServerRunning = true;
+                AppendConsole($"TCP Server listening on {TcpBindIp}:{TcpPort}", "NET");
+                _ = Task.Run(() => AcceptLoopAsync(_tcpCts.Token));
+            }
+            catch (Exception ex)
+            {
+                _tcpServerRunning = false;
+                AppendConsole($"TCP Server start failed: {ex.Message}", "ERR");
+            }
+        }
+
+        private void StopTcpServer()
+        {
+            try
+            {
+                _tcpCts?.Cancel();
+                _tcpListener?.Stop();
+            }
+            catch
+            {
+                // ignore shutdown exceptions
+            }
+            finally
+            {
+                _tcpServerRunning = false;
+            }
+        }
+
+        private async Task AcceptLoopAsync(CancellationToken ct)
+        {
+            if (_tcpListener == null) return;
+
+            while (!ct.IsCancellationRequested)
+            {
+                TcpClient? client = null;
+                try
+                {
+                    client = await _tcpListener.AcceptTcpClientAsync(ct);
+                    _ = Task.Run(() => HandleClientAsync(client, ct), ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    BeginInvoke(new Action(() => AppendConsole($"Accept failed: {ex.Message}", "ERR")));
+                    client?.Dispose();
+                }
+            }
+        }
+
+        private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+        {
+            var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+            BeginInvoke(new Action(() => AppendConsole($"Client connected: {endpoint}", "NET")));
+
+            try
+            {
+                await using var stream = client.GetStream();
+                using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
+                await using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true)
+                {
+                    AutoFlush = true,
+                    NewLine = "\n"
+                };
+
+                await writer.WriteLineAsync("Opta Modbus Demo TCP ready. Type HELP.");
+
+                while (!ct.IsCancellationRequested)
+                {
+                    var line = await reader.ReadLineAsync();
+                    if (line == null) break;
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+
+                    string response = string.Empty;
+                    await InvokeAsync(() =>
+                    {
+                        AppendConsole($">(TCP:{endpoint}) {line}", "CMD");
+                        response = ExecuteCommand(line.Trim());
+                        AppendConsole(response, "RSP");
+                        RefreshAllViews();
+                    });
+
+                    await writer.WriteLineAsync(response);
+                }
+            }
+            catch (Exception ex)
+            {
+                BeginInvoke(new Action(() => AppendConsole($"Client error ({endpoint}): {ex.Message}", "ERR")));
+            }
+            finally
+            {
+                client.Dispose();
+                BeginInvoke(new Action(() => AppendConsole($"Client disconnected: {endpoint}", "NET")));
+            }
+        }
+
+        private Task InvokeAsync(Action action)
+        {
+            if (InvokeRequired)
+            {
+                var tcs = new TaskCompletionSource<object?>();
+                BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        action();
+                        tcs.SetResult(null);
+                    }
+                    catch (Exception ex)
+                    {
+                        tcs.SetException(ex);
+                    }
+                }));
+                return tcs.Task;
+            }
+
+            action();
+            return Task.CompletedTask;
         }
 
         private void AppendConsole(string message, string level)
