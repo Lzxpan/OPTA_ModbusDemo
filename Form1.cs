@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
 using System.Text;
@@ -15,10 +16,12 @@ namespace OPTA_ModbusDemo
         private readonly Label _lblHeader = new();
         private readonly Label _lblSubHeader = new();
         private readonly Label _lblAiMode = new();
+        private readonly Button _btnOptaConnect = new();
         private readonly Button _btnPollingToggle = new();
         private readonly Label _lblPollingState = new();
         private readonly Label _lblIoState = new();
         private readonly Label _lblLastCycle = new();
+        private readonly Label _lblOptaConn = new();
 
         private readonly DataGridView _gridAi = new();
         private readonly DataGridView _gridDio4 = new();
@@ -71,6 +74,7 @@ namespace OPTA_ModbusDemo
         private string _lastIoCommand = "-";
         private string _lastIoKind = "IDLE";
         private string _lastIoError = "-";
+        private bool _optaConnected;
         private bool _pollingEnabled = true;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
@@ -112,6 +116,22 @@ namespace OPTA_ModbusDemo
             }
         }
 
+        private void ConnectOptaNow()
+        {
+            _optaConnected = SendOptaCommand("HELP", out var rsp);
+            if (_optaConnected)
+            {
+                var first = rsp.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? "OK";
+                AppendConsole($"OPTA connected: {first}", "NET");
+            }
+            else
+            {
+                AppendConsole($"OPTA connect failed: {_lastIoError}", "ERR");
+            }
+
+            UpdateRuntimeStatusUi();
+        }
+
         private void UpdateRuntimeStatusUi()
         {
             if (IsDisposed || !IsHandleCreated) return;
@@ -123,6 +143,8 @@ namespace OPTA_ModbusDemo
 
             _lblPollingState.Text = _pollingEnabled ? "Polling: RUN" : "Polling: STOP";
             _lblPollingState.ForeColor = _pollingEnabled ? Color.ForestGreen : Color.Firebrick;
+            _lblOptaConn.Text = _optaConnected ? "OPTA: CONNECTED" : "OPTA: DISCONNECTED";
+            _lblOptaConn.ForeColor = _optaConnected ? Color.ForestGreen : Color.Firebrick;
             _lblIoState.Text = $"I/O: {_lastIoKind} | CMD: {_lastIoCommand}";
             _lblLastCycle.Text = $"Last Poll: {DateTime.Now:HH:mm:ss} | Queue: {_pendingSetCommands.Count} | Err: {_lastIoError}";
         }
@@ -144,6 +166,12 @@ namespace OPTA_ModbusDemo
             _lblSubHeader.AutoSize = true;
             _lblSubHeader.Location = new Point(18, 44);
 
+            _btnOptaConnect.Text = "連線 OPTA";
+            _btnOptaConnect.Location = new Point(810, 38);
+            _btnOptaConnect.Size = new Size(110, 28);
+            _btnOptaConnect.BackColor = Color.FromArgb(234, 243, 255);
+            _btnOptaConnect.Click += (_, _) => ConnectOptaNow();
+
             _btnPollingToggle.Text = "停止輪詢";
             _btnPollingToggle.Location = new Point(930, 38);
             _btnPollingToggle.Size = new Size(110, 28);
@@ -161,6 +189,10 @@ namespace OPTA_ModbusDemo
             _lblLastCycle.AutoSize = true;
             _lblLastCycle.Location = new Point(1050, 64);
             _lblLastCycle.Font = new Font("Segoe UI", 8);
+
+            _lblOptaConn.AutoSize = true;
+            _lblOptaConn.Location = new Point(1050, 24);
+            _lblOptaConn.Font = new Font("Segoe UI", 9, FontStyle.Bold);
 
             _tabDevices.Location = new Point(16, 74);
             _tabDevices.Size = new Size(1080, 790);
@@ -180,7 +212,9 @@ namespace OPTA_ModbusDemo
             Controls.AddRange([
                 _lblHeader,
                 _lblSubHeader,
+                _btnOptaConnect,
                 _btnPollingToggle,
+                _lblOptaConn,
                 _lblPollingState,
                 _lblIoState,
                 _lblLastCycle,
@@ -424,9 +458,14 @@ namespace OPTA_ModbusDemo
             var p = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             if (p.Length == 0) return "ERR Empty command";
 
-            if (p[0].Equals("HELP", StringComparison.OrdinalIgnoreCase))
+            if (p.Length == 1 && p[0].Equals("HELP", StringComparison.OrdinalIgnoreCase))
             {
-                return "HELP | READ/SET AI4 DO8 DIO4 DI8";
+                if (!SendOptaCommand("HELP", out var helpRsp))
+                {
+                    return $"ERR OPTA CONNECT FAILED: {_lastIoError}";
+                }
+
+                return helpRsp;
             }
 
             if (p.Length < 2) return "ERR Invalid command";
@@ -792,7 +831,12 @@ namespace OPTA_ModbusDemo
                     client.ReceiveTimeout = 1200;
                     client.SendTimeout = 1200;
                     var connectTask = client.ConnectAsync(OptaIp, OptaTcpPort);
-                    if (!connectTask.Wait(1200)) return false;
+                    if (!connectTask.Wait(1200))
+                    {
+                        _lastIoError = "Connect timeout";
+                        _optaConnected = false;
+                        return false;
+                    }
 
                     using var stream = client.GetStream();
                     using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
@@ -803,10 +847,27 @@ namespace OPTA_ModbusDemo
                     };
 
                     writer.WriteLine(cmd);
-                    response = reader.ReadLine() ?? string.Empty;
+                    var lines = new List<string>();
+                    var wait = Stopwatch.StartNew();
+                    while (wait.ElapsedMilliseconds < 350)
+                    {
+                        if (!stream.DataAvailable)
+                        {
+                            Thread.Sleep(10);
+                            continue;
+                        }
+
+                        var line = reader.ReadLine();
+                        if (line == null) break;
+                        lines.Add(line);
+                        wait.Restart();
+                    }
+
+                    response = string.Join('\n', lines);
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "IDLE";
                     _lastIoError = "-";
+                    _optaConnected = true;
                     return !string.IsNullOrWhiteSpace(response);
                 }
                 catch (Exception ex)
@@ -814,6 +875,7 @@ namespace OPTA_ModbusDemo
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "ERR";
                     _lastIoError = ex.Message;
+                    _optaConnected = false;
                     UpdateRuntimeStatusUi();
                     return false;
                 }
