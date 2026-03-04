@@ -79,7 +79,7 @@ namespace OPTA_ModbusDemo
         private string _lastIoKind = "IDLE";
         private string _lastIoError = "-";
         private bool _optaConnected;
-        private bool _pollingEnabled = true;
+        private bool _pollingEnabled;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
@@ -90,11 +90,8 @@ namespace OPTA_ModbusDemo
             InitializeComponent();
             BuildLayout();
             InitializeDemoState();
-            ConnectOptaNow();
-            PrimeAi4TypesOnStartup();
             RefreshAllViews();
             ConfigureRefreshTimer();
-            _ = TriggerPollAndRefreshAsync();
             AppendConsole("系統啟動完成。輸入 HELP 查看指令。", "INFO");
             FormClosing += (_, _) =>
             {
@@ -128,6 +125,12 @@ namespace OPTA_ModbusDemo
 
         private void TogglePolling()
         {
+            if (!_optaConnected)
+            {
+                AppendConsole("請先連線 OPTA。", "WARN");
+                return;
+            }
+
             _pollingEnabled = !_pollingEnabled;
             _btnPollingToggle.Text = _pollingEnabled ? "停止輪詢" : "開始輪詢";
             UpdateRuntimeStatusUi();
@@ -141,6 +144,16 @@ namespace OPTA_ModbusDemo
 
         private void ConnectOptaNow()
         {
+            if (_optaConnected)
+            {
+                DisconnectOpta();
+                _pollingEnabled = false;
+                _btnPollingToggle.Text = "開始輪詢";
+                AppendConsole("OPTA disconnected.", "NET");
+                UpdateRuntimeStatusUi();
+                return;
+            }
+
             lock (_optaIoSync)
             {
                 DisconnectOpta();
@@ -191,6 +204,8 @@ namespace OPTA_ModbusDemo
             {
                 var first = rsp.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? "OK";
                 AppendConsole($"OPTA connected: {first}", "NET");
+                PrimeAi4TypesOnStartup();
+                RefreshAllViews();
             }
             else
             {
@@ -227,6 +242,7 @@ namespace OPTA_ModbusDemo
             _lblPollingState.ForeColor = _pollingEnabled ? Color.ForestGreen : Color.Firebrick;
             _lblOptaConn.Text = _optaConnected ? "OPTA: CONNECTED" : "OPTA: DISCONNECTED";
             _lblOptaConn.ForeColor = _optaConnected ? Color.ForestGreen : Color.Firebrick;
+            _btnOptaConnect.Text = _optaConnected ? "斷線 OPTA" : "連線 OPTA";
             _lblIoState.Text = $"I/O: {_lastIoKind} | CMD: {_lastIoCommand}";
             _lblLastCycle.Text = $"Last Poll: {DateTime.Now:HH:mm:ss} | Queue: {_pendingSetCommands.Count} | Err: {_lastIoError}";
         }
@@ -254,7 +270,7 @@ namespace OPTA_ModbusDemo
             _btnOptaConnect.BackColor = Color.FromArgb(234, 243, 255);
             _btnOptaConnect.Click += (_, _) => ConnectOptaNow();
 
-            _btnPollingToggle.Text = "停止輪詢";
+            _btnPollingToggle.Text = "開始輪詢";
             _btnPollingToggle.Location = new Point(930, 38);
             _btnPollingToggle.Size = new Size(110, 28);
             _btnPollingToggle.BackColor = Color.FromArgb(234, 243, 255);
@@ -908,6 +924,12 @@ namespace OPTA_ModbusDemo
                     _lastIoCommand = cmd;
                     _lastIoKind = cmd.StartsWith("SET", StringComparison.OrdinalIgnoreCase) ? "WRITE" : "READ";
 
+                    // clear any stale buffered lines from previous unfinished multi-line responses
+                    while (_optaStream.DataAvailable)
+                    {
+                        _ = _optaReader.ReadLine();
+                    }
+
                     var elapsedMs = (DateTime.UtcNow - _lastOptaIoUtc).TotalMilliseconds;
                     if (_lastOptaIoUtc != DateTime.MinValue && elapsedMs < OptaIoIntervalMs)
                     {
@@ -916,11 +938,18 @@ namespace OPTA_ModbusDemo
 
                     _optaWriter.WriteLine(cmd);
                     var lines = new List<string>();
-                    var wait = Stopwatch.StartNew();
-                    while (wait.ElapsedMilliseconds < 350)
+                    var (totalTimeoutMs, idleGapMs) = GetResponseTiming(cmd);
+                    var totalWait = Stopwatch.StartNew();
+                    var idleWait = Stopwatch.StartNew();
+                    while (totalWait.ElapsedMilliseconds < totalTimeoutMs)
                     {
                         if (!_optaStream.DataAvailable)
                         {
+                            if (lines.Count > 0 && idleWait.ElapsedMilliseconds >= idleGapMs)
+                            {
+                                break;
+                            }
+
                             Thread.Sleep(10);
                             continue;
                         }
@@ -928,15 +957,15 @@ namespace OPTA_ModbusDemo
                         var line = _optaReader.ReadLine();
                         if (line == null) break;
                         lines.Add(line);
-                        wait.Restart();
+                        idleWait.Restart();
                     }
 
                     response = string.Join('\n', lines);
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "IDLE";
-                    _lastIoError = "-";
+                    _lastIoError = lines.Count == 0 ? "Empty response" : "-";
                     _optaConnected = true;
-                    return !string.IsNullOrWhiteSpace(response);
+                    return lines.Count > 0;
                 }
                 catch (Exception ex)
                 {
@@ -948,6 +977,23 @@ namespace OPTA_ModbusDemo
                     return false;
                 }
             }
+        }
+
+        private static (int totalTimeoutMs, int idleGapMs) GetResponseTiming(string cmd)
+        {
+            var upper = cmd.ToUpperInvariant();
+
+            if (upper == "HELP")
+            {
+                return (4000, 120);
+            }
+
+            if (upper == "READ AI4 ALL")
+            {
+                return (3000, 120);
+            }
+
+            return (1200, 25);
         }
 
         private static bool TryExtractType(string text, out ushort type)
