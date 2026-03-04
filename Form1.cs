@@ -70,6 +70,7 @@ namespace OPTA_ModbusDemo
         private DateTime _lastOptaIoUtc = DateTime.MinValue;
         private string _lastIoCommand = "-";
         private string _lastIoKind = "IDLE";
+        private string _lastIoError = "-";
         private bool _pollingEnabled = true;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
@@ -123,7 +124,7 @@ namespace OPTA_ModbusDemo
             _lblPollingState.Text = _pollingEnabled ? "Polling: RUN" : "Polling: STOP";
             _lblPollingState.ForeColor = _pollingEnabled ? Color.ForestGreen : Color.Firebrick;
             _lblIoState.Text = $"I/O: {_lastIoKind} | CMD: {_lastIoCommand}";
-            _lblLastCycle.Text = $"Last Poll: {DateTime.Now:HH:mm:ss} | Queue: {_pendingSetCommands.Count}";
+            _lblLastCycle.Text = $"Last Poll: {DateTime.Now:HH:mm:ss} | Queue: {_pendingSetCommands.Count} | Err: {_lastIoError}";
         }
 
         private void BuildLayout()
@@ -446,7 +447,7 @@ namespace OPTA_ModbusDemo
 
             if (!SendOptaCommand(cmd, out var response))
             {
-                return "ERR OPTA CONNECT FAILED";
+                return $"ERR OPTA CONNECT FAILED: {_lastIoError}";
             }
 
             UpdateStateFromResponse(cmd, response);
@@ -787,6 +788,7 @@ namespace OPTA_ModbusDemo
                     }
 
                     using var client = new TcpClient();
+                    client.NoDelay = true;
                     client.ReceiveTimeout = 1200;
                     client.SendTimeout = 1200;
                     var connectTask = client.ConnectAsync(OptaIp, OptaTcpPort);
@@ -797,20 +799,21 @@ namespace OPTA_ModbusDemo
                     using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true)
                     {
                         AutoFlush = true,
-                        NewLine = "\n"
+                        NewLine = "\r\n"
                     };
 
-                    _ = reader.ReadLine();
                     writer.WriteLine(cmd);
                     response = reader.ReadLine() ?? string.Empty;
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "IDLE";
+                    _lastIoError = "-";
                     return !string.IsNullOrWhiteSpace(response);
                 }
-                catch
+                catch (Exception ex)
                 {
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "ERR";
+                    _lastIoError = ex.Message;
                     UpdateRuntimeStatusUi();
                     return false;
                 }

@@ -93,3 +93,4 @@
 
 - 若 Opta 離線或無法連線，讀值/控制命令會回 `ERR OPTA CONNECT FAILED`。
 - 本版已移除所有 Modbus client 程式碼，避免 PC 端直接訪問 AI4/DO8/DIO4/DI8。
+- 若右側持續出現連線失敗，請先確認 Opta `192.168.2.100:5000` 可達，且 Opta 回應格式為「每行一個命令回應」。
