@@ -3,6 +3,7 @@ using System.IO;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
 
 namespace OPTA_ModbusDemo
 {
@@ -14,6 +15,7 @@ namespace OPTA_ModbusDemo
         private readonly Label _lblHeader = new();
         private readonly Label _lblSubHeader = new();
         private readonly Label _lblAiMode = new();
+        private readonly Button _btnPollingToggle = new();
 
         private readonly DataGridView _gridAi = new();
         private readonly DataGridView _gridDio4 = new();
@@ -60,8 +62,10 @@ namespace OPTA_ModbusDemo
         private const int OptaTcpPort = 5000;
         private const int OptaIoIntervalMs = 50;
         private readonly object _optaIoSync = new();
+        private readonly ConcurrentQueue<string> _pendingSetCommands = new();
         private readonly string[] _aiValueText = new string[8];
         private DateTime _lastOptaIoUtc = DateTime.MinValue;
+        private bool _pollingEnabled = true;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
@@ -71,6 +75,8 @@ namespace OPTA_ModbusDemo
             InitializeComponent();
             BuildLayout();
             InitializeDemoState();
+            PrimeAi4TypesOnStartup();
+            RefreshAllViews();
             ConfigureRefreshTimer();
             _ = TriggerPollAndRefreshAsync();
             AppendConsole("系統啟動完成。輸入 HELP 查看指令。", "INFO");
@@ -81,9 +87,22 @@ namespace OPTA_ModbusDemo
             _refreshTimer.Interval = 500;
             _refreshTimer.Tick += (_, _) =>
             {
+                if (!_pollingEnabled) return;
                 _ = TriggerPollAndRefreshAsync();
             };
             _refreshTimer.Start();
+        }
+
+        private void TogglePolling()
+        {
+            _pollingEnabled = !_pollingEnabled;
+            _btnPollingToggle.Text = _pollingEnabled ? "停止輪詢" : "開始輪詢";
+            AppendConsole(_pollingEnabled ? "Polling started." : "Polling stopped.", "INFO");
+
+            if (_pollingEnabled)
+            {
+                _ = TriggerPollAndRefreshAsync();
+            }
         }
 
         private void BuildLayout()
@@ -103,6 +122,12 @@ namespace OPTA_ModbusDemo
             _lblSubHeader.AutoSize = true;
             _lblSubHeader.Location = new Point(18, 44);
 
+            _btnPollingToggle.Text = "停止輪詢";
+            _btnPollingToggle.Location = new Point(930, 38);
+            _btnPollingToggle.Size = new Size(110, 28);
+            _btnPollingToggle.BackColor = Color.FromArgb(234, 243, 255);
+            _btnPollingToggle.Click += (_, _) => TogglePolling();
+
             _tabDevices.Location = new Point(16, 74);
             _tabDevices.Size = new Size(1080, 790);
 
@@ -118,7 +143,7 @@ namespace OPTA_ModbusDemo
             BuildDi8Tab(di8Page);
             BuildConsolePanel();
 
-            Controls.AddRange([_lblHeader, _lblSubHeader, _tabDevices, _txtConsole, _txtCommand]);
+            Controls.AddRange([_lblHeader, _lblSubHeader, _btnPollingToggle, _tabDevices, _txtConsole, _txtCommand]);
         }
 
         private void BuildAiTab(TabPage page)
@@ -367,6 +392,12 @@ namespace OPTA_ModbusDemo
                 return "ERR Unknown command";
             }
 
+            if (verb == "SET" && _pollingEnabled)
+            {
+                _pendingSetCommands.Enqueue(cmd);
+                return "QUEUED";
+            }
+
             if (!SendOptaCommand(cmd, out var response))
             {
                 return "ERR OPTA CONNECT FAILED";
@@ -394,6 +425,23 @@ namespace OPTA_ModbusDemo
                 _dio4Do[i] = false;
                 _dio4Count[i] = 0;
             }
+        }
+
+        private void PrimeAi4TypesOnStartup()
+        {
+            for (var ch = 0; ch < 8; ch++)
+            {
+                if (!SendOptaCommand($"READ AI4 CH{ch}", out var rsp)) continue;
+                if (TryExtractType(rsp, out var type)) _aiType[ch] = type;
+                if (TryExtractValueText(rsp, out var valueText)) _aiValueText[ch] = valueText;
+            }
+        }
+
+        private void ProcessPendingSetCommandIfAny()
+        {
+            if (!_pendingSetCommands.TryDequeue(out var setCmd)) return;
+            if (!SendOptaCommand(setCmd, out var response)) return;
+            UpdateStateFromResponse(setCmd, response);
         }
 
         private void RefreshAllViews()
@@ -565,6 +613,8 @@ namespace OPTA_ModbusDemo
             var ok = true;
             for (var ch = 0; ch < 8; ch++)
             {
+                ProcessPendingSetCommandIfAny();
+
                 if (!SendOptaCommand($"READ AI4 CH{ch}", out var valRsp))
                 {
                     ok = false;
@@ -592,6 +642,8 @@ namespace OPTA_ModbusDemo
             var ok = true;
             for (var ch = 0; ch < 8; ch++)
             {
+                ProcessPendingSetCommandIfAny();
+
                 if (!SendOptaCommand($"READ DO8 CH{ch}", out var rsp))
                 {
                     ok = false;
@@ -611,6 +663,8 @@ namespace OPTA_ModbusDemo
             var ok = true;
             for (var ch = 0; ch < 4; ch++)
             {
+                ProcessPendingSetCommandIfAny();
+
                 if (SendOptaCommand($"READ DIO4 DI{ch}", out var diRsp) && TryExtractLastInt(diRsp, out var diVal))
                     _dio4Di[ch] = diVal != 0;
                 else
@@ -636,6 +690,8 @@ namespace OPTA_ModbusDemo
             var ok = true;
             for (var ch = 0; ch < 8; ch++)
             {
+                ProcessPendingSetCommandIfAny();
+
                 if (SendOptaCommand($"READ DI8 CH{ch}", out var diRsp) && TryExtractLastInt(diRsp, out var diVal))
                     _di8[ch] = diVal != 0;
                 else
