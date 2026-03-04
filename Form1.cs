@@ -16,6 +16,9 @@ namespace OPTA_ModbusDemo
         private readonly Label _lblSubHeader = new();
         private readonly Label _lblAiMode = new();
         private readonly Button _btnPollingToggle = new();
+        private readonly Label _lblPollingState = new();
+        private readonly Label _lblIoState = new();
+        private readonly Label _lblLastCycle = new();
 
         private readonly DataGridView _gridAi = new();
         private readonly DataGridView _gridDio4 = new();
@@ -65,6 +68,8 @@ namespace OPTA_ModbusDemo
         private readonly ConcurrentQueue<string> _pendingSetCommands = new();
         private readonly string[] _aiValueText = new string[8];
         private DateTime _lastOptaIoUtc = DateTime.MinValue;
+        private string _lastIoCommand = "-";
+        private string _lastIoKind = "IDLE";
         private bool _pollingEnabled = true;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
@@ -97,12 +102,28 @@ namespace OPTA_ModbusDemo
         {
             _pollingEnabled = !_pollingEnabled;
             _btnPollingToggle.Text = _pollingEnabled ? "停止輪詢" : "開始輪詢";
+            UpdateRuntimeStatusUi();
             AppendConsole(_pollingEnabled ? "Polling started." : "Polling stopped.", "INFO");
 
             if (_pollingEnabled)
             {
                 _ = TriggerPollAndRefreshAsync();
             }
+        }
+
+        private void UpdateRuntimeStatusUi()
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(UpdateRuntimeStatusUi));
+                return;
+            }
+
+            _lblPollingState.Text = _pollingEnabled ? "Polling: RUN" : "Polling: STOP";
+            _lblPollingState.ForeColor = _pollingEnabled ? Color.ForestGreen : Color.Firebrick;
+            _lblIoState.Text = $"I/O: {_lastIoKind} | CMD: {_lastIoCommand}";
+            _lblLastCycle.Text = $"Last Poll: {DateTime.Now:HH:mm:ss} | Queue: {_pendingSetCommands.Count}";
         }
 
         private void BuildLayout()
@@ -128,6 +149,18 @@ namespace OPTA_ModbusDemo
             _btnPollingToggle.BackColor = Color.FromArgb(234, 243, 255);
             _btnPollingToggle.Click += (_, _) => TogglePolling();
 
+            _lblPollingState.AutoSize = true;
+            _lblPollingState.Location = new Point(1050, 44);
+            _lblPollingState.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+
+            _lblIoState.AutoSize = true;
+            _lblIoState.Location = new Point(1180, 44);
+            _lblIoState.Font = new Font("Segoe UI", 9);
+
+            _lblLastCycle.AutoSize = true;
+            _lblLastCycle.Location = new Point(1050, 64);
+            _lblLastCycle.Font = new Font("Segoe UI", 8);
+
             _tabDevices.Location = new Point(16, 74);
             _tabDevices.Size = new Size(1080, 790);
 
@@ -143,7 +176,19 @@ namespace OPTA_ModbusDemo
             BuildDi8Tab(di8Page);
             BuildConsolePanel();
 
-            Controls.AddRange([_lblHeader, _lblSubHeader, _btnPollingToggle, _tabDevices, _txtConsole, _txtCommand]);
+            Controls.AddRange([
+                _lblHeader,
+                _lblSubHeader,
+                _btnPollingToggle,
+                _lblPollingState,
+                _lblIoState,
+                _lblLastCycle,
+                _tabDevices,
+                _txtConsole,
+                _txtCommand
+            ]);
+
+            UpdateRuntimeStatusUi();
         }
 
         private void BuildAiTab(TabPage page)
@@ -395,6 +440,7 @@ namespace OPTA_ModbusDemo
             if (verb == "SET" && _pollingEnabled)
             {
                 _pendingSetCommands.Enqueue(cmd);
+                UpdateRuntimeStatusUi();
                 return "QUEUED";
             }
 
@@ -587,6 +633,7 @@ namespace OPTA_ModbusDemo
                     BeginInvoke(new Action(() =>
                     {
                         RefreshAllViews();
+                        UpdateRuntimeStatusUi();
                     }));
                 }
             }
@@ -729,6 +776,10 @@ namespace OPTA_ModbusDemo
             {
                 try
                 {
+                    _lastIoCommand = cmd;
+                    _lastIoKind = cmd.StartsWith("SET", StringComparison.OrdinalIgnoreCase) ? "WRITE" : "READ";
+                    UpdateRuntimeStatusUi();
+
                     var elapsedMs = (DateTime.UtcNow - _lastOptaIoUtc).TotalMilliseconds;
                     if (_lastOptaIoUtc != DateTime.MinValue && elapsedMs < OptaIoIntervalMs)
                     {
@@ -753,11 +804,14 @@ namespace OPTA_ModbusDemo
                     writer.WriteLine(cmd);
                     response = reader.ReadLine() ?? string.Empty;
                     _lastOptaIoUtc = DateTime.UtcNow;
+                    _lastIoKind = "IDLE";
                     return !string.IsNullOrWhiteSpace(response);
                 }
                 catch
                 {
                     _lastOptaIoUtc = DateTime.UtcNow;
+                    _lastIoKind = "ERR";
+                    UpdateRuntimeStatusUi();
                     return false;
                 }
             }

@@ -73,6 +73,11 @@
 2. Build & Run（Windows / .NET 8）
 3. 右側 Console 輸入命令，或用各分頁按鈕操作
 4. 可用上方按鈕切換 `開始輪詢 / 停止輪詢`
+5. 上方會即時顯示：
+   - `Polling: RUN/STOP`
+   - `I/O: READ/WRITE/IDLE/ERR`
+   - `CMD`（目前正在執行的命令）
+   - `Last Poll` 時間與 `Queue` 長度
 
 ### 輪詢機制（最新）
 
