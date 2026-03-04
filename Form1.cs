@@ -68,6 +68,10 @@ namespace OPTA_ModbusDemo
         private const int OptaTcpPort = 5000;
         private const int OptaIoIntervalMs = 50;
         private readonly object _optaIoSync = new();
+        private TcpClient? _optaClient;
+        private NetworkStream? _optaStream;
+        private StreamReader? _optaReader;
+        private StreamWriter? _optaWriter;
         private readonly ConcurrentQueue<string> _pendingSetCommands = new();
         private readonly string[] _aiValueText = new string[8];
         private DateTime _lastOptaIoUtc = DateTime.MinValue;
@@ -79,28 +83,47 @@ namespace OPTA_ModbusDemo
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
+        private readonly CancellationTokenSource _pollCts = new();
 
         public Form1()
         {
             InitializeComponent();
             BuildLayout();
             InitializeDemoState();
+            ConnectOptaNow();
             PrimeAi4TypesOnStartup();
             RefreshAllViews();
             ConfigureRefreshTimer();
             _ = TriggerPollAndRefreshAsync();
             AppendConsole("系統啟動完成。輸入 HELP 查看指令。", "INFO");
+            FormClosing += (_, _) =>
+            {
+                _pollCts.Cancel();
+                DisconnectOpta();
+            };
         }
 
         private void ConfigureRefreshTimer()
         {
-            _refreshTimer.Interval = 500;
-            _refreshTimer.Tick += (_, _) =>
+            _ = Task.Run(async () =>
             {
-                if (!_pollingEnabled) return;
-                _ = TriggerPollAndRefreshAsync();
-            };
-            _refreshTimer.Start();
+                while (!_pollCts.IsCancellationRequested)
+                {
+                    if (_pollingEnabled)
+                    {
+                        await TriggerPollAndRefreshAsync();
+                    }
+
+                    try
+                    {
+                        await Task.Delay(500, _pollCts.Token);
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        break;
+                    }
+                }
+            });
         }
 
         private void TogglePolling()
@@ -118,6 +141,51 @@ namespace OPTA_ModbusDemo
 
         private void ConnectOptaNow()
         {
+            lock (_optaIoSync)
+            {
+                DisconnectOpta();
+                try
+                {
+                    var client = new TcpClient
+                    {
+                        NoDelay = true,
+                        ReceiveTimeout = 1200,
+                        SendTimeout = 1200
+                    };
+                    var connectTask = client.ConnectAsync(OptaIp, OptaTcpPort);
+                    if (!connectTask.Wait(1200))
+                    {
+                        _lastIoError = "Connect timeout";
+                        _optaConnected = false;
+                    }
+                    else
+                    {
+                        _optaClient = client;
+                        _optaStream = client.GetStream();
+                        _optaReader = new StreamReader(_optaStream, Encoding.UTF8, leaveOpen: true);
+                        _optaWriter = new StreamWriter(_optaStream, new UTF8Encoding(false), leaveOpen: true)
+                        {
+                            AutoFlush = true,
+                            NewLine = "\r\n"
+                        };
+                        _optaConnected = true;
+                        _lastIoError = "-";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _lastIoError = ex.Message;
+                    _optaConnected = false;
+                }
+            }
+
+            if (!_optaConnected)
+            {
+                AppendConsole($"OPTA connect failed: {_lastIoError}", "ERR");
+                UpdateRuntimeStatusUi();
+                return;
+            }
+
             _optaConnected = SendOptaCommand("HELP", out var rsp);
             if (_optaConnected)
             {
@@ -130,6 +198,20 @@ namespace OPTA_ModbusDemo
             }
 
             UpdateRuntimeStatusUi();
+        }
+
+        private void DisconnectOpta()
+        {
+            try { _optaWriter?.Dispose(); } catch { }
+            try { _optaReader?.Dispose(); } catch { }
+            try { _optaStream?.Dispose(); } catch { }
+            try { _optaClient?.Close(); } catch { }
+
+            _optaWriter = null;
+            _optaReader = null;
+            _optaStream = null;
+            _optaClient = null;
+            _optaConnected = false;
         }
 
         private void UpdateRuntimeStatusUi()
@@ -445,12 +527,13 @@ namespace OPTA_ModbusDemo
             _txtCommand.Clear();
         }
 
-        private void ExecuteAndEcho(string cmd)
+        private async void ExecuteAndEcho(string cmd)
         {
             AppendConsole($"> {cmd}", "CMD");
-            var result = ExecuteCommand(cmd);
+            var result = await Task.Run(() => ExecuteCommand(cmd));
             AppendConsole(result, "RSP");
             RefreshAllViews();
+            UpdateRuntimeStatusUi();
         }
 
         private string ExecuteCommand(string cmd)
@@ -816,9 +899,14 @@ namespace OPTA_ModbusDemo
             {
                 try
                 {
+                    if (!_optaConnected || _optaClient == null || _optaStream == null || _optaReader == null || _optaWriter == null)
+                    {
+                        _lastIoError = "OPTA not connected";
+                        return false;
+                    }
+
                     _lastIoCommand = cmd;
                     _lastIoKind = cmd.StartsWith("SET", StringComparison.OrdinalIgnoreCase) ? "WRITE" : "READ";
-                    UpdateRuntimeStatusUi();
 
                     var elapsedMs = (DateTime.UtcNow - _lastOptaIoUtc).TotalMilliseconds;
                     if (_lastOptaIoUtc != DateTime.MinValue && elapsedMs < OptaIoIntervalMs)
@@ -826,38 +914,18 @@ namespace OPTA_ModbusDemo
                         Thread.Sleep(OptaIoIntervalMs - (int)elapsedMs);
                     }
 
-                    using var client = new TcpClient();
-                    client.NoDelay = true;
-                    client.ReceiveTimeout = 1200;
-                    client.SendTimeout = 1200;
-                    var connectTask = client.ConnectAsync(OptaIp, OptaTcpPort);
-                    if (!connectTask.Wait(1200))
-                    {
-                        _lastIoError = "Connect timeout";
-                        _optaConnected = false;
-                        return false;
-                    }
-
-                    using var stream = client.GetStream();
-                    using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
-                    using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true)
-                    {
-                        AutoFlush = true,
-                        NewLine = "\r\n"
-                    };
-
-                    writer.WriteLine(cmd);
+                    _optaWriter.WriteLine(cmd);
                     var lines = new List<string>();
                     var wait = Stopwatch.StartNew();
                     while (wait.ElapsedMilliseconds < 350)
                     {
-                        if (!stream.DataAvailable)
+                        if (!_optaStream.DataAvailable)
                         {
                             Thread.Sleep(10);
                             continue;
                         }
 
-                        var line = reader.ReadLine();
+                        var line = _optaReader.ReadLine();
                         if (line == null) break;
                         lines.Add(line);
                         wait.Restart();
@@ -875,7 +943,7 @@ namespace OPTA_ModbusDemo
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "ERR";
                     _lastIoError = ex.Message;
-                    _optaConnected = false;
+                    DisconnectOpta();
                     UpdateRuntimeStatusUi();
                     return false;
                 }
