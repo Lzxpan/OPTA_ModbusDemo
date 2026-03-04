@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -181,6 +182,9 @@ namespace OPTA_ModbusDemo
                             AutoFlush = true,
                             NewLine = "\r\n"
                         };
+
+                        // Consume any server greeting immediately after connect
+                        _ = ReadIncomingLines(600, 120);
                         _optaConnected = true;
                         _lastIoError = "-";
                     }
@@ -199,18 +203,9 @@ namespace OPTA_ModbusDemo
                 return;
             }
 
-            _optaConnected = SendOptaCommand("HELP", out var rsp);
-            if (_optaConnected)
-            {
-                var first = rsp.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? "OK";
-                AppendConsole($"OPTA connected: {first}", "NET");
-                PrimeAi4TypesOnStartup();
-                RefreshAllViews();
-            }
-            else
-            {
-                AppendConsole($"OPTA connect failed: {_lastIoError}", "ERR");
-            }
+            AppendConsole("OPTA connected.", "NET");
+            PrimeAi4TypesOnStartup();
+            RefreshAllViews();
 
             UpdateRuntimeStatusUi();
         }
@@ -227,6 +222,7 @@ namespace OPTA_ModbusDemo
             _optaStream = null;
             _optaClient = null;
             _optaConnected = false;
+            while (_pendingSetCommands.TryDequeue(out _)) { }
         }
 
         private void UpdateRuntimeStatusUi()
@@ -924,12 +920,6 @@ namespace OPTA_ModbusDemo
                     _lastIoCommand = cmd;
                     _lastIoKind = cmd.StartsWith("SET", StringComparison.OrdinalIgnoreCase) ? "WRITE" : "READ";
 
-                    // clear any stale buffered lines from previous unfinished multi-line responses
-                    while (_optaStream.DataAvailable)
-                    {
-                        _ = _optaReader.ReadLine();
-                    }
-
                     var elapsedMs = (DateTime.UtcNow - _lastOptaIoUtc).TotalMilliseconds;
                     if (_lastOptaIoUtc != DateTime.MinValue && elapsedMs < OptaIoIntervalMs)
                     {
@@ -937,30 +927,10 @@ namespace OPTA_ModbusDemo
                     }
 
                     _optaWriter.WriteLine(cmd);
-                    var lines = new List<string>();
                     var (totalTimeoutMs, idleGapMs) = GetResponseTiming(cmd);
-                    var totalWait = Stopwatch.StartNew();
-                    var idleWait = Stopwatch.StartNew();
-                    while (totalWait.ElapsedMilliseconds < totalTimeoutMs)
-                    {
-                        if (!_optaStream.DataAvailable)
-                        {
-                            if (lines.Count > 0 && idleWait.ElapsedMilliseconds >= idleGapMs)
-                            {
-                                break;
-                            }
+                    var lines = ReadIncomingLines(totalTimeoutMs, idleGapMs);
 
-                            Thread.Sleep(10);
-                            continue;
-                        }
-
-                        var line = _optaReader.ReadLine();
-                        if (line == null) break;
-                        lines.Add(line);
-                        idleWait.Restart();
-                    }
-
-                    response = string.Join('\n', lines);
+                    response = CollapseResponseForCommand(cmd, lines);
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "IDLE";
                     _lastIoError = lines.Count == 0 ? "Empty response" : "-";
@@ -977,6 +947,58 @@ namespace OPTA_ModbusDemo
                     return false;
                 }
             }
+        }
+
+        private List<string> ReadIncomingLines(int totalTimeoutMs, int idleGapMs)
+        {
+            var lines = new List<string>();
+            if (_optaStream == null || _optaReader == null) return lines;
+
+            var totalWait = Stopwatch.StartNew();
+            var idleWait = Stopwatch.StartNew();
+            while (totalWait.ElapsedMilliseconds < totalTimeoutMs)
+            {
+                if (!_optaStream.DataAvailable)
+                {
+                    if (lines.Count > 0 && idleWait.ElapsedMilliseconds >= idleGapMs)
+                    {
+                        break;
+                    }
+
+                    Thread.Sleep(10);
+                    continue;
+                }
+
+                var line = _optaReader.ReadLine();
+                if (line == null) break;
+                lines.Add(line);
+                idleWait.Restart();
+            }
+
+            return lines;
+        }
+
+        private static string CollapseResponseForCommand(string cmd, List<string> lines)
+        {
+            if (lines.Count == 0) return string.Empty;
+
+            var sanitized = lines
+                .Select(l => l.Trim())
+                .Where(l => !string.IsNullOrWhiteSpace(l))
+                .Where(l => !l.StartsWith("Connected to", StringComparison.OrdinalIgnoreCase))
+                .Where(l => !l.StartsWith("Type HELP", StringComparison.OrdinalIgnoreCase))
+                .Where(l => !l.StartsWith(">", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (sanitized.Count == 0) sanitized = lines;
+
+            var upper = cmd.ToUpperInvariant();
+            if (upper == "HELP" || upper == "READ AI4 ALL")
+            {
+                return string.Join('\n', sanitized);
+            }
+
+            return sanitized[^1];
         }
 
         private static (int totalTimeoutMs, int idleGapMs) GetResponseTiming(string cmd)
