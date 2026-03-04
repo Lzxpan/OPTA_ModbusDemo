@@ -23,6 +23,7 @@
 - 每次輪詢 AI4 時，會同時讀取：
   - `READ AI4 CH<n>`（值與 type）
   - `READ AI4 RAW CH<n>`（raw）
+- 對 Opta 的每筆讀寫間隔固定為 **50ms**（輪詢節流）。
 
 ---
 
@@ -32,9 +33,6 @@
 
 ### 通用
 - `HELP`
-- `STATUS`（被動，顯示 UI 目前快取狀態）
-- `STATUS PROBE`（主動向 Opta 探測）
-- `RESET CONNECTIONS`
 
 ### AI4
 - `READ AI4 CH<n>`
@@ -79,5 +77,5 @@
 
 ## 5. 備註
 
-- 若 Opta 離線或無法連線，UI 會顯示裝置 FAIL / DISCONNECTED。
+- 若 Opta 離線或無法連線，讀值/控制命令會回 `ERR OPTA CONNECT FAILED`。
 - 本版已移除所有 Modbus client 程式碼，避免 PC 端直接訪問 AI4/DO8/DIO4/DI8。

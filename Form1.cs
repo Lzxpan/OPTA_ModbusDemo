@@ -57,14 +57,11 @@ namespace OPTA_ModbusDemo
 
         private const string OptaIp = "192.168.2.100";
 
-        private readonly Label _lblAi4Status = new();
-        private readonly Label _lblDo8Status = new();
-        private readonly Label _lblDio4Status = new();
-        private readonly Label _lblDi8Status = new();
-
         private const int OptaTcpPort = 5000;
+        private const int OptaIoIntervalMs = 50;
         private readonly object _optaIoSync = new();
         private readonly string[] _aiValueText = new string[8];
+        private DateTime _lastOptaIoUtc = DateTime.MinValue;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
@@ -120,13 +117,8 @@ namespace OPTA_ModbusDemo
             BuildDo8Tab(do8Page);
             BuildDi8Tab(di8Page);
             BuildConsolePanel();
-            var statusY = 46;
-            SetupStatusLabel(_lblAi4Status, "AI4", 760, statusY);
-            SetupStatusLabel(_lblDo8Status, "DO8", 880, statusY);
-            SetupStatusLabel(_lblDio4Status, "DIO4", 1000, statusY);
-            SetupStatusLabel(_lblDi8Status, "DI8", 1120, statusY);
 
-            Controls.AddRange([_lblHeader, _lblSubHeader, _tabDevices, _txtConsole, _txtCommand, _lblAi4Status, _lblDo8Status, _lblDio4Status, _lblDi8Status]);
+            Controls.AddRange([_lblHeader, _lblSubHeader, _tabDevices, _txtConsole, _txtCommand]);
         }
 
         private void BuildAiTab(TabPage page)
@@ -363,23 +355,7 @@ namespace OPTA_ModbusDemo
 
             if (p[0].Equals("HELP", StringComparison.OrdinalIgnoreCase))
             {
-                return "HELP | STATUS (passive) | STATUS PROBE | RESET CONNECTIONS | READ/SET AI4 DO8 DIO4 DI8";
-            }
-
-            if (p[0].Equals("STATUS", StringComparison.OrdinalIgnoreCase))
-            {
-                if (p.Length >= 2 && p[1].Equals("PROBE", StringComparison.OrdinalIgnoreCase))
-                {
-                    return ProbeStatusFromOpta();
-                }
-
-                return $"AI4={(_isAi4Connected ? "OK" : "DISCONNECTED")} DO8={(_isDo8Connected ? "OK" : "DISCONNECTED")} DIO4={(_isDio4Connected ? "OK" : "DISCONNECTED")} DI8={(_isDi8Connected ? "OK" : "DISCONNECTED")}";
-            }
-
-            if (p.Length >= 2 && p[0].Equals("RESET", StringComparison.OrdinalIgnoreCase) && p[1].Equals("CONNECTIONS", StringComparison.OrdinalIgnoreCase))
-            {
-                if (!SendOptaCommand("RESET CONNECTIONS", out var resetRsp)) return "ERR OPTA CONNECT FAILED";
-                return resetRsp;
+                return "HELP | READ/SET AI4 DO8 DIO4 DI8";
             }
 
             if (p.Length < 2) return "ERR Invalid command";
@@ -542,18 +518,6 @@ namespace OPTA_ModbusDemo
             return int.TryParse(token[prefix.Length..], out index) && index >= 0 && index < maxExclusive;
         }
 
-        private void SetupStatusLabel(Label label, string deviceName, int x, int y)
-        {
-            label.AutoSize = false;
-            label.TextAlign = ContentAlignment.MiddleCenter;
-            label.Font = new Font("Segoe UI", 9, FontStyle.Bold);
-            label.Location = new Point(x, y);
-            label.Size = new Size(110, 24);
-            label.Text = $"{deviceName}: CHECK";
-            label.BackColor = Color.DarkGray;
-            label.ForeColor = Color.White;
-        }
-
         private async Task TriggerPollAndRefreshAsync()
         {
             if (_pollInFlight) return;
@@ -574,7 +538,6 @@ namespace OPTA_ModbusDemo
                 {
                     BeginInvoke(new Action(() =>
                     {
-                        UpdateStatusLabels();
                         RefreshAllViews();
                     }));
                 }
@@ -595,27 +558,6 @@ namespace OPTA_ModbusDemo
             _isDo8Connected = PollDo8();
             _isDio4Connected = PollDio4();
             _isDi8Connected = PollDi8();
-        }
-
-        private void UpdateStatusLabels()
-        {
-            if (IsDisposed || !IsHandleCreated) return;
-            if (InvokeRequired)
-            {
-                BeginInvoke(new Action(UpdateStatusLabels));
-                return;
-            }
-
-            SetStatus(_lblAi4Status, "AI4", _isAi4Connected);
-            SetStatus(_lblDo8Status, "DO8", _isDo8Connected);
-            SetStatus(_lblDio4Status, "DIO4", _isDio4Connected);
-            SetStatus(_lblDi8Status, "DI8", _isDi8Connected);
-        }
-
-        private static void SetStatus(Label label, string name, bool ok)
-        {
-            label.Text = ok ? $"{name}: OK" : $"{name}: FAIL";
-            label.BackColor = ok ? Color.ForestGreen : Color.Firebrick;
         }
 
         private bool PollAi4()
@@ -709,17 +651,6 @@ namespace OPTA_ModbusDemo
             return ok;
         }
 
-        private string ProbeStatusFromOpta()
-        {
-            if (!SendOptaCommand("STATUS PROBE", out var rsp)) return "ERR OPTA CONNECT FAILED";
-
-            _isAi4Connected = TryExtractDeviceStatus(rsp, "AI4", _isAi4Connected);
-            _isDo8Connected = TryExtractDeviceStatus(rsp, "DO8", _isDo8Connected);
-            _isDio4Connected = TryExtractDeviceStatus(rsp, "DIO4", _isDio4Connected);
-            _isDi8Connected = TryExtractDeviceStatus(rsp, "DI8", _isDi8Connected);
-            return rsp;
-        }
-
         private void UpdateStateFromResponse(string command, string response)
         {
             var upper = command.ToUpperInvariant();
@@ -742,6 +673,12 @@ namespace OPTA_ModbusDemo
             {
                 try
                 {
+                    var elapsedMs = (DateTime.UtcNow - _lastOptaIoUtc).TotalMilliseconds;
+                    if (_lastOptaIoUtc != DateTime.MinValue && elapsedMs < OptaIoIntervalMs)
+                    {
+                        Thread.Sleep(OptaIoIntervalMs - (int)elapsedMs);
+                    }
+
                     using var client = new TcpClient();
                     client.ReceiveTimeout = 1200;
                     client.SendTimeout = 1200;
@@ -759,10 +696,12 @@ namespace OPTA_ModbusDemo
                     _ = reader.ReadLine();
                     writer.WriteLine(cmd);
                     response = reader.ReadLine() ?? string.Empty;
+                    _lastOptaIoUtc = DateTime.UtcNow;
                     return !string.IsNullOrWhiteSpace(response);
                 }
                 catch
                 {
+                    _lastOptaIoUtc = DateTime.UtcNow;
                     return false;
                 }
             }
@@ -821,13 +760,6 @@ namespace OPTA_ModbusDemo
 
             value = text[(idx + 6)..].Trim();
             return true;
-        }
-
-        private static bool TryExtractDeviceStatus(string text, string device, bool fallback)
-        {
-            var m = Regex.Match(text, $@"\b{device}\s*=\s*(OK|DISCONNECTED|FAIL)\b", RegexOptions.IgnoreCase);
-            if (!m.Success) return fallback;
-            return m.Groups[1].Value.Equals("OK", StringComparison.OrdinalIgnoreCase);
         }
 
         private void AppendConsole(string message, string level)
