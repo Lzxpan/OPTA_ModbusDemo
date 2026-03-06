@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Opta Modbus TCP Multi-Device Demo - Device Focused Tabs v5</title>
+  <style>
+    :root { --bg:#eef3fb; --card:#fff; --line:#d7e2f2; --text:#1f2a37; --blue:#2f80ed; --ok:#1f9d55; --warn:#f2994a; }
+    *{box-sizing:border-box;font-family:"Segoe UI","Noto Sans TC",sans-serif}
+    body{margin:0;background:linear-gradient(180deg,#f7faff,#eef3fb);color:var(--text)}
+    .page{max-width:1500px;margin:0 auto;padding:20px}
+    .hero{background:linear-gradient(120deg,#2f80ed,#1f5fb3);color:#fff;border-radius:16px;padding:18px 22px;display:flex;justify-content:space-between;align-items:center}
+    .hero h1{margin:0 0 5px;font-size:24px}.hero p{margin:0;font-size:13px;opacity:.95}
+    .badges{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.badge{padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.35);font-size:12px}
+    .tabs{margin-top:14px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+    .tab-head{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}
+    .tab{padding:10px;border-radius:10px;border:1px solid #c2d5f0;background:#f7fbff;text-align:center;font-weight:700;font-size:13px}
+    .active{background:#eaf3ff;border-color:#8cb4ef;color:#1f5eb8}
+    .panel{border:1px solid #cfe0f8;border-radius:12px;overflow:hidden;margin-bottom:12px}
+    .ptitle{background:#f2f7ff;padding:10px 12px;font-weight:700;font-size:14px;display:flex;justify-content:space-between}
+    .status{background:var(--ok);color:#fff;border-radius:999px;padding:4px 8px;font-size:11px}
+    .grid2{display:grid;grid-template-columns:1.45fr .85fr;gap:10px;padding:10px}
+    .card{border:1px solid #d7e4f6;border-radius:10px;background:#fbfdff;padding:10px}
+    .card h4{margin:0 0 8px;font-size:13px;color:#2b4f84}
+    .controls{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}
+    .btn{border:1px solid #b8d0f3;background:#f1f7ff;color:#1d4fa2;border-radius:8px;padding:8px;font-size:12px;text-align:center;font-weight:600}
+    .mode{padding:8px;border-radius:8px;font-size:12px;margin-bottom:8px}
+    .single{background:#e8f4ff;border:1px solid #c5ddfb;color:#1f5eb8}
+    .diff{background:#fff4e8;border:1px solid #ffd9b5;color:#b75b00}
+    .owner{color:#0f766e;font-weight:700}.follower{color:#9a3412;font-weight:700}
+    table{width:100%;border-collapse:collapse;font-size:12px} th,td{padding:6px;border-bottom:1px solid #e5edf8;text-align:left} th{background:#f4f8ff}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <div>
+        <h1>Opta Modbus TCP Multi-Device Demo（UI v5）</h1>
+        <p>AI4 固定顯示 CH0~CH7。僅在差動 Type（0x0106~0x010A、0x0203）時，兩 port 成對運算且輸出歸低編號 port。</p>
+      </div>
+      <div class="badges">
+        <span class="badge">Opta 192.168.2.100:5000</span><span class="badge">TCP Listening</span>
+        <span class="badge">Serial Ready</span><span class="badge">4 Devices Connected</span>
+      </div>
+    </section>
+
+    <section class="tabs">
+      <div class="tab-head">
+        <div class="tab active">AI4 分頁</div><div class="tab">DIO4 分頁</div><div class="tab">DO8 分頁</div><div class="tab">DI8 分頁</div>
+      </div>
+
+      <div class="panel">
+        <div class="ptitle">AI4 專屬頁（固定 CH0~CH7）<span class="status">192.168.2.111 Connected</span></div>
+        <div class="grid2">
+          <div class="card">
+            <h4>AI4 顯示模式 + 8 通道輸出規則</h4>
+            <div class="mode single"><b>Single-ended</b>：TYPE 0x0101~0x0105、0x0201~0x0202，CH0~CH7 各自輸出。</div>
+            <div class="mode diff"><b>Differential</b>：TYPE 0x0106~0x010A、0x0203，(0,1)(2,3)(4,5)(6,7) 成對，輸出歸低編號 CH。</div>
+            <table>
+              <thead><tr><th>CH</th><th>Port</th><th>Mode</th><th>Pair</th><th>Output Owner</th><th>Raw/Calc</th><th>Value</th></tr></thead>
+              <tbody>
+                <tr><td>CH0</td><td>AI0</td><td>Single</td><td>-</td><td class="owner">Owner</td><td>8459231</td><td>0.504 V</td></tr>
+                <tr><td>CH1</td><td>AI1</td><td>Single</td><td>-</td><td class="owner">Owner</td><td>6441233</td><td>0.384 V</td></tr>
+                <tr><td>CH2</td><td>AI2</td><td>Single</td><td>-</td><td class="owner">Owner</td><td>10242221</td><td>13.773 mA</td></tr>
+                <tr><td>CH3</td><td>AI3</td><td>Single</td><td>-</td><td class="owner">Owner</td><td>7340011</td><td>8.750 mA</td></tr>
+                <tr><td>CH4</td><td>AI4</td><td>Single</td><td>-</td><td class="owner">Owner</td><td>5200111</td><td>0.310 V</td></tr>
+                <tr><td>CH5</td><td>AI5</td><td>Single</td><td>-</td><td class="owner">Owner</td><td>9012455</td><td>5.371 V</td></tr>
+                <tr><td>CH6</td><td>AI6</td><td>Diff</td><td>CH6-CH7</td><td class="owner">Owner (Low CH)</td><td>AI6-AI7</td><td>-3.22 V</td></tr>
+                <tr><td>CH7</td><td>AI7</td><td>Diff</td><td>CH6-CH7</td><td class="follower">Follower</td><td>N/A</td><td>N/A (paired with CH6)</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h4>AI4 命令控制（僅 AI4）</h4>
+            <div class="controls">
+              <div class="btn">READ AI4 CH0</div><div class="btn">READ AI4 CH7</div>
+              <div class="btn">READ AI4 ALL</div><div class="btn">SET AI4 TYPE 0x0103</div>
+              <div class="btn">SET AI4 TYPE 0x0106</div><div class="btn">SET AI4 TYPE 0x0203</div>
+              <div class="btn">SET AI4 CH2 TYPE 0x0201</div><div class="btn">SET AI4 CH6 TYPE 0x0108</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel"><div class="ptitle">DIO4 專屬頁<span class="status">192.168.2.113 Connected</span></div></div>
+      <div class="panel"><div class="ptitle">DO8 專屬頁<span class="status">192.168.2.112 Connected</span></div></div>
+      <div class="panel"><div class="ptitle">DI8 專屬頁<span class="status">192.168.2.114 Connected</span></div></div>
+    </section>
+  </div>
+</body>
+</html>
