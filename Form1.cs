@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -81,6 +80,9 @@ namespace OPTA_ModbusDemo
         private string _lastIoError = "-";
         private bool _optaConnected;
         private bool _pollingEnabled;
+        private int _consecutiveIoFailures;
+        private string _lastDisconnectReason = "-";
+        private DateTime _lastDisconnectUtc = DateTime.MinValue;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
@@ -100,7 +102,7 @@ namespace OPTA_ModbusDemo
             FormClosing += (_, _) =>
             {
                 _pollCts.Cancel();
-                DisconnectOpta();
+                DisconnectOpta("視窗關閉", emitLog: false);
             };
         }
 
@@ -150,7 +152,7 @@ namespace OPTA_ModbusDemo
         {
             if (_optaConnected)
             {
-                DisconnectOpta();
+                DisconnectOpta("使用者手動斷線", emitLog: true);
                 _pollingEnabled = false;
                 _btnPollingToggle.Text = "開始輪詢";
                 AppendConsole("OPTA disconnected.", "NET");
@@ -160,7 +162,7 @@ namespace OPTA_ModbusDemo
 
             lock (_optaIoSync)
             {
-                DisconnectOpta();
+                DisconnectOpta("連線前清理舊連線", emitLog: false);
                 try
                 {
                     var client = new TcpClient
@@ -174,6 +176,7 @@ namespace OPTA_ModbusDemo
                     {
                         _lastIoError = "Connect timeout";
                         _optaConnected = false;
+                        client.Close();
                     }
                     else
                     {
@@ -187,7 +190,7 @@ namespace OPTA_ModbusDemo
                         };
 
                         // Consume any server greeting immediately after connect
-                        _ = ReadIncomingLines(600, 120);
+                        _ = ReadIncomingLines(out _, out _);
                         _optaConnected = true;
                         _lastIoError = "-";
                     }
@@ -212,7 +215,7 @@ namespace OPTA_ModbusDemo
             UpdateRuntimeStatusUi();
         }
 
-        private void DisconnectOpta()
+        private void DisconnectOpta(string reason = "未知原因", bool emitLog = false)
         {
             try { _optaWriter?.Dispose(); } catch { }
             try { _optaReader?.Dispose(); } catch { }
@@ -224,6 +227,18 @@ namespace OPTA_ModbusDemo
             _optaStream = null;
             _optaClient = null;
             _optaConnected = false;
+            _pollingEnabled = false;
+            _lastDisconnectReason = reason;
+            _lastDisconnectUtc = DateTime.UtcNow;
+            if (!IsDisposed && IsHandleCreated)
+            {
+                BeginInvoke(new Action(() => _btnPollingToggle.Text = "開始輪詢"));
+            }
+            _consecutiveIoFailures = 0;
+            if (emitLog)
+            {
+                AppendConsoleThreadSafe($"OPTA disconnected: {reason}", "DIAG");
+            }
             while (_pendingSetCommands.TryDequeue(out _)) { }
         }
 
@@ -242,7 +257,8 @@ namespace OPTA_ModbusDemo
             _lblOptaConn.ForeColor = _optaConnected ? Color.ForestGreen : Color.Firebrick;
             _btnOptaConnect.Text = _optaConnected ? "斷線 OPTA" : "連線 OPTA";
             _lblIoState.Text = $"I/O: {_lastIoKind} | CMD: {_lastIoCommand}";
-            _lblLastCycle.Text = $"Last Poll: {DateTime.Now:HH:mm:ss} | Queue: {_pendingSetCommands.Count} | Err: {_lastIoError}";
+            var disconnectNote = _optaConnected || _lastDisconnectUtc == DateTime.MinValue ? string.Empty : $" | Disc: {_lastDisconnectReason}";
+            _lblLastCycle.Text = $"Last Poll: {DateTime.Now:HH:mm:ss} | Queue: {_pendingSetCommands.Count} | Err: {_lastIoError}{disconnectNote}";
         }
 
         private void BuildLayout()
@@ -938,7 +954,10 @@ namespace OPTA_ModbusDemo
                 {
                     if (!_optaConnected || _optaClient == null || _optaStream == null || _optaReader == null || _optaWriter == null)
                     {
-                        _lastIoError = "OPTA not connected";
+                        _lastIoError = _lastDisconnectUtc == DateTime.MinValue
+                            ? "OPTA not connected"
+                            : $"OPTA not connected (last: {_lastDisconnectReason})";
+                        AppendConsoleThreadSafe($"跳過命令 {cmd}：{_lastIoError}", "DIAG");
                         return false;
                     }
 
@@ -952,59 +971,104 @@ namespace OPTA_ModbusDemo
                     }
 
                     _optaWriter.WriteLine(cmd);
-                    var (totalTimeoutMs, idleGapMs) = GetResponseTiming(cmd);
-                    var lines = ReadIncomingLines(totalTimeoutMs, idleGapMs);
+                    var lines = ReadIncomingLines(out var sawTerminator, out var stopReason);
 
                     response = CollapseResponseForCommand(cmd, lines);
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "IDLE";
-                    _lastIoError = lines.Count == 0 ? "Empty response" : "-";
-                    _optaConnected = true;
-                    return lines.Count > 0;
+                    var hasMatchedResponse = !string.IsNullOrWhiteSpace(response);
+                    var hasServerReconnectHint = lines.Any(l => l.Contains("TCP command client connected.", StringComparison.OrdinalIgnoreCase));
+                    var failReason = lines.Count == 0
+                        ? $"Empty response ({stopReason})"
+                        : !sawTerminator
+                            ? $"Packet incomplete ({stopReason})"
+                            : hasMatchedResponse
+                                ? "-"
+                                : "Response mismatch/ERR";
+                    _lastIoError = failReason;
+                    if (hasMatchedResponse && sawTerminator)
+                    {
+                        _optaConnected = true;
+                        _consecutiveIoFailures = 0;
+                        if (hasServerReconnectHint)
+                        {
+                            AppendConsoleThreadSafe($"偵測到伺服器重連提示（命令 {cmd}），可能曾發生短暫斷線。", "DIAG");
+                        }
+                        return true;
+                    }
+
+                    _consecutiveIoFailures++;
+                    AppendConsoleThreadSafe($"I/O 失敗 #{_consecutiveIoFailures}: CMD={cmd} | Stop={stopReason} | Terminator={(sawTerminator ? "Y" : "N")} | Lines={lines.Count} | Best='{response}'", "DIAG");
+                    if (hasServerReconnectHint)
+                    {
+                        AppendConsoleThreadSafe("回應中出現 'TCP command client connected.'，研判為裝置端重新接受連線。", "DIAG");
+                    }
+
+                    if (_consecutiveIoFailures >= 3)
+                    {
+                        var sample = BuildRawLineSample(lines);
+                        DisconnectOpta($"連續 {_consecutiveIoFailures} 次 I/O 失敗；最後命令={cmd}；原因={failReason}；Stop={stopReason}；Sample={sample}", emitLog: true);
+                    }
+
+                    return false;
                 }
                 catch (Exception ex)
                 {
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "ERR";
                     _lastIoError = ex.Message;
-                    DisconnectOpta();
+                    _consecutiveIoFailures++;
+                    DisconnectOpta($"例外斷線：{ex.GetType().Name} {ex.Message} | CMD={cmd}", emitLog: true);
                     UpdateRuntimeStatusUi();
                     return false;
                 }
             }
         }
 
-        private List<string> ReadIncomingLines(int totalTimeoutMs, int idleGapMs)
+        private List<string> ReadIncomingLines(out bool sawTerminator, out string stopReason)
         {
+            sawTerminator = false;
+            stopReason = "";
             var lines = new List<string>();
-            if (_optaStream == null || _optaReader == null) return lines;
-
-            var totalWait = Stopwatch.StartNew();
-            var idleWait = Stopwatch.StartNew();
-            while (totalWait.ElapsedMilliseconds < totalTimeoutMs)
+            if (_optaReader == null)
             {
-                if (!_optaStream.DataAvailable)
-                {
-                    if (lines.Count > 0 && idleWait.ElapsedMilliseconds >= idleGapMs)
-                    {
-                        break;
-                    }
+                stopReason = "Reader null";
+                return lines;
+            }
 
-                    Thread.Sleep(10);
-                    continue;
+            while (true)
+            {
+                string? line;
+                try
+                {
+                    line = _optaReader.ReadLine();
+                }
+                catch (IOException ex)
+                {
+                    stopReason = $"IOException: {ex.Message}";
+                    break;
                 }
 
-                var line = _optaReader.ReadLine();
-                if (line == null) break;
+                if (line == null)
+                {
+                    stopReason = "EOF(null)";
+                    break;
+                }
 
                 var trimmed = line.Trim();
                 if (trimmed.Equals("<br>", StringComparison.OrdinalIgnoreCase) || trimmed.Equals("<br/>", StringComparison.OrdinalIgnoreCase))
                 {
+                    sawTerminator = true;
+                    stopReason = "Terminator <br>";
                     break;
                 }
 
                 lines.Add(line);
-                idleWait.Restart();
+            }
+
+            if (string.IsNullOrWhiteSpace(stopReason))
+            {
+                stopReason = "Unknown";
             }
 
             return lines;
@@ -1044,20 +1108,40 @@ namespace OPTA_ModbusDemo
 
             if (terminals.Count == 0)
             {
-                return sanitized[^1];
+                return string.Empty;
             }
 
             var expected = BuildExpectedResponseHints(cmd);
-            var best = terminals
+            var matched = terminals
                 .Select(x => new
                 {
                     x.line,
                     x.idx,
                     score = ScoreResponseLine(x.line, expected)
                 })
+                .Where(x => x.score > 0)
+                .ToList();
+
+            if (matched.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            if (matched.Any(x => x.line.StartsWith("ERR", StringComparison.OrdinalIgnoreCase)))
+            {
+                return string.Empty;
+            }
+
+            var best = matched
+                .Where(x => x.line.StartsWith("OK", StringComparison.OrdinalIgnoreCase))
                 .OrderByDescending(x => x.score)
                 .ThenByDescending(x => x.idx)
-                .First();
+                .FirstOrDefault();
+
+            if (best == null)
+            {
+                return string.Empty;
+            }
 
             return best.line;
         }
@@ -1097,6 +1181,26 @@ namespace OPTA_ModbusDemo
 
         private static int ScoreResponseLine(string line, string[] hints)
         {
+            if (!TryGetCommandSignature(hints, out var deviceHint, out var chHint, out var keywordHint))
+            {
+                return 0;
+            }
+
+            if (!line.Contains(deviceHint, StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+
+            if (!string.IsNullOrEmpty(chHint) && !LineContainsChannel(line, chHint))
+            {
+                return 0;
+            }
+
+            if (!string.IsNullOrEmpty(keywordHint) && !line.Contains(keywordHint, StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+
             var score = 0;
             foreach (var hint in hints)
             {
@@ -1108,21 +1212,23 @@ namespace OPTA_ModbusDemo
             return score;
         }
 
-        private static (int totalTimeoutMs, int idleGapMs) GetResponseTiming(string cmd)
+        private static bool TryGetCommandSignature(string[] hints, out string deviceHint, out string chHint, out string keywordHint)
         {
-            var upper = cmd.ToUpperInvariant();
+            deviceHint = hints.FirstOrDefault(h => h is "AI4" or "DO8" or "DIO4" or "DI8") ?? string.Empty;
+            chHint = hints.FirstOrDefault(h => h.StartsWith("CH", StringComparison.OrdinalIgnoreCase)) ?? string.Empty;
+            keywordHint = hints.FirstOrDefault(h => h is "ACTIVE" or "POWERON" or "TYPE" or "RAW") ?? string.Empty;
+            return !string.IsNullOrWhiteSpace(deviceHint);
+        }
 
-            if (upper == "HELP")
-            {
-                return (5000, 250);
-            }
+        private static bool LineContainsChannel(string line, string chHint)
+        {
+            if (line.Contains(chHint, StringComparison.OrdinalIgnoreCase)) return true;
 
-            if (upper == "READ AI4 ALL")
-            {
-                return (3500, 180);
-            }
+            if (!int.TryParse(chHint[2..], out var index)) return false;
 
-            return (1500, 60);
+            return line.Contains($"DI{index}", StringComparison.OrdinalIgnoreCase)
+                || line.Contains($"DO{index}", StringComparison.OrdinalIgnoreCase)
+                || line.Contains($"AI{index}", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool TryExtractType(string text, out ushort type)
@@ -1205,6 +1311,25 @@ namespace OPTA_ModbusDemo
 
             value = text[(idx + 6)..].Trim();
             return true;
+        }
+
+
+        private static string BuildRawLineSample(List<string> lines)
+        {
+            if (lines.Count == 0) return "(empty)";
+            return string.Join(" || ", lines.Take(3).Select(l => l.Trim()));
+        }
+
+        private void AppendConsoleThreadSafe(string message, string level)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(() => AppendConsole(message, level)));
+                return;
+            }
+
+            AppendConsole(message, level);
         }
 
         private void AppendConsole(string message, string level)
