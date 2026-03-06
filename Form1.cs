@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -189,7 +188,7 @@ namespace OPTA_ModbusDemo
                         };
 
                         // Consume any server greeting immediately after connect
-                        _ = ReadIncomingLines(600, 120);
+                        _ = ReadIncomingLines();
                         _optaConnected = true;
                         _lastIoError = "-";
                     }
@@ -226,6 +225,11 @@ namespace OPTA_ModbusDemo
             _optaStream = null;
             _optaClient = null;
             _optaConnected = false;
+            _pollingEnabled = false;
+            if (!IsDisposed && IsHandleCreated)
+            {
+                BeginInvoke(new Action(() => _btnPollingToggle.Text = "開始輪詢"));
+            }
             _consecutiveIoFailures = 0;
             while (_pendingSetCommands.TryDequeue(out _)) { }
         }
@@ -955,17 +959,16 @@ namespace OPTA_ModbusDemo
                     }
 
                     _optaWriter.WriteLine(cmd);
-                    var (totalTimeoutMs, idleGapMs) = GetResponseTiming(cmd);
-                    var lines = ReadIncomingLines(totalTimeoutMs, idleGapMs);
+                    var lines = ReadIncomingLines();
 
                     response = CollapseResponseForCommand(cmd, lines);
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "IDLE";
                     var hasMatchedResponse = !string.IsNullOrWhiteSpace(response);
                     _lastIoError = lines.Count == 0 ? "Empty response" : (hasMatchedResponse ? "-" : "Response mismatch");
-                    _optaConnected = hasMatchedResponse;
                     if (hasMatchedResponse)
                     {
+                        _optaConnected = true;
                         _consecutiveIoFailures = 0;
                         return true;
                     }
@@ -991,27 +994,23 @@ namespace OPTA_ModbusDemo
             }
         }
 
-        private List<string> ReadIncomingLines(int totalTimeoutMs, int idleGapMs)
+        private List<string> ReadIncomingLines()
         {
             var lines = new List<string>();
-            if (_optaStream == null || _optaReader == null) return lines;
+            if (_optaReader == null) return lines;
 
-            var totalWait = Stopwatch.StartNew();
-            var idleWait = Stopwatch.StartNew();
-            while (totalWait.ElapsedMilliseconds < totalTimeoutMs)
+            while (true)
             {
-                if (!_optaStream.DataAvailable)
+                string? line;
+                try
                 {
-                    if (lines.Count > 0 && idleWait.ElapsedMilliseconds >= idleGapMs)
-                    {
-                        break;
-                    }
-
-                    Thread.Sleep(10);
-                    continue;
+                    line = _optaReader.ReadLine();
+                }
+                catch (IOException)
+                {
+                    break;
                 }
 
-                var line = _optaReader.ReadLine();
                 if (line == null) break;
 
                 var trimmed = line.Trim();
@@ -1021,7 +1020,6 @@ namespace OPTA_ModbusDemo
                 }
 
                 lines.Add(line);
-                idleWait.Restart();
             }
 
             return lines;
@@ -1061,11 +1059,11 @@ namespace OPTA_ModbusDemo
 
             if (terminals.Count == 0)
             {
-                return sanitized[^1];
+                return string.Empty;
             }
 
             var expected = BuildExpectedResponseHints(cmd);
-            var best = terminals
+            var matched = terminals
                 .Select(x => new
                 {
                     x.line,
@@ -1073,6 +1071,20 @@ namespace OPTA_ModbusDemo
                     score = ScoreResponseLine(x.line, expected)
                 })
                 .Where(x => x.score > 0)
+                .ToList();
+
+            if (matched.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            if (matched.Any(x => x.line.StartsWith("ERR", StringComparison.OrdinalIgnoreCase)))
+            {
+                return string.Empty;
+            }
+
+            var best = matched
+                .Where(x => x.line.StartsWith("OK", StringComparison.OrdinalIgnoreCase))
                 .OrderByDescending(x => x.score)
                 .ThenByDescending(x => x.idx)
                 .FirstOrDefault();
@@ -1168,23 +1180,6 @@ namespace OPTA_ModbusDemo
             return line.Contains($"DI{index}", StringComparison.OrdinalIgnoreCase)
                 || line.Contains($"DO{index}", StringComparison.OrdinalIgnoreCase)
                 || line.Contains($"AI{index}", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static (int totalTimeoutMs, int idleGapMs) GetResponseTiming(string cmd)
-        {
-            var upper = cmd.ToUpperInvariant();
-
-            if (upper == "HELP")
-            {
-                return (5000, 250);
-            }
-
-            if (upper == "READ AI4 ALL")
-            {
-                return (3500, 180);
-            }
-
-            return (1500, 60);
         }
 
         private static bool TryExtractType(string text, out ushort type)
