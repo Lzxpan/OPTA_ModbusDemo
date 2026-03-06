@@ -66,7 +66,7 @@ namespace OPTA_ModbusDemo
         private const string OptaIp = "192.168.2.100";
 
         private const int OptaTcpPort = 5000;
-        private const int OptaIoIntervalMs = 50;
+        private const int OptaIoIntervalMs = 250;
         private readonly object _optaIoSync = new();
         private TcpClient? _optaClient;
         private NetworkStream? _optaStream;
@@ -83,6 +83,7 @@ namespace OPTA_ModbusDemo
         private int _consecutiveIoFailures;
         private string _lastDisconnectReason = "-";
         private DateTime _lastDisconnectUtc = DateTime.MinValue;
+        private bool _reconnecting;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
@@ -228,6 +229,7 @@ namespace OPTA_ModbusDemo
             _optaClient = null;
             _optaConnected = false;
             _pollingEnabled = false;
+            _lastIoCommand = "-";
             _lastDisconnectReason = reason;
             _lastDisconnectUtc = DateTime.UtcNow;
             if (!IsDisposed && IsHandleCreated)
@@ -633,6 +635,11 @@ namespace OPTA_ModbusDemo
             UpdateStateFromResponse(setCmd, response);
         }
 
+        private bool ShouldAbortPollingWork()
+        {
+            return !_pollingEnabled || !_optaConnected || _reconnecting;
+        }
+
         private void RefreshAllViews()
         {
             RefreshAiGrid();
@@ -814,14 +821,19 @@ namespace OPTA_ModbusDemo
 
         private void PollAllDevices()
         {
+            if (ShouldAbortPollingWork()) return;
+
             _isAi4Connected = PollAi4();
             QueueUiRefreshFromBackground(force: true);
+            if (ShouldAbortPollingWork()) return;
 
             _isDo8Connected = PollDo8();
             QueueUiRefreshFromBackground(force: true);
+            if (ShouldAbortPollingWork()) return;
 
             _isDio4Connected = PollDio4();
             QueueUiRefreshFromBackground(force: true);
+            if (ShouldAbortPollingWork()) return;
 
             _isDi8Connected = PollDi8();
             QueueUiRefreshFromBackground(force: true);
@@ -832,7 +844,10 @@ namespace OPTA_ModbusDemo
             var successCount = 0;
             for (var ch = 0; ch < 8; ch++)
             {
+                if (ShouldAbortPollingWork()) break;
+
                 ProcessPendingSetCommandIfAny();
+                if (ShouldAbortPollingWork()) break;
 
                 if (!SendOptaCommand($"READ AI4 CH{ch}", out var valRsp))
                 {
@@ -854,7 +869,10 @@ namespace OPTA_ModbusDemo
             var successCount = 0;
             for (var ch = 0; ch < 8; ch++)
             {
+                if (ShouldAbortPollingWork()) break;
+
                 ProcessPendingSetCommandIfAny();
+                if (ShouldAbortPollingWork()) break;
 
                 if (!SendOptaCommand($"READ DO8 CH{ch}", out var rsp))
                 {
@@ -866,8 +884,8 @@ namespace OPTA_ModbusDemo
                 QueueUiRefreshFromBackground();
             }
 
-            if (SendOptaCommand("READ DO8 POWERON", out var powerRsp) && TryExtractLastInt(powerRsp, out var powerVal)) _do8PowerOn = powerVal;
-            if (SendOptaCommand("READ DO8 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _do8Active = activeVal;
+            if (!ShouldAbortPollingWork() && SendOptaCommand("READ DO8 POWERON", out var powerRsp) && TryExtractLastInt(powerRsp, out var powerVal)) _do8PowerOn = powerVal;
+            if (!ShouldAbortPollingWork() && SendOptaCommand("READ DO8 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _do8Active = activeVal;
             return successCount > 0;
         }
 
@@ -876,7 +894,10 @@ namespace OPTA_ModbusDemo
             var successCount = 0;
             for (var ch = 0; ch < 4; ch++)
             {
+                if (ShouldAbortPollingWork()) break;
+
                 ProcessPendingSetCommandIfAny();
+                if (ShouldAbortPollingWork()) break;
 
                 if (SendOptaCommand($"READ DIO4 DI{ch}", out var diRsp) && TryExtractDigitalState(diRsp, out var diVal))
                 {
@@ -900,7 +921,7 @@ namespace OPTA_ModbusDemo
                 }
             }
 
-            if (SendOptaCommand("READ DIO4 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _dio4Active = activeVal;
+            if (!ShouldAbortPollingWork() && SendOptaCommand("READ DIO4 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _dio4Active = activeVal;
             return successCount > 0;
         }
 
@@ -909,7 +930,10 @@ namespace OPTA_ModbusDemo
             var successCount = 0;
             for (var ch = 0; ch < 8; ch++)
             {
+                if (ShouldAbortPollingWork()) break;
+
                 ProcessPendingSetCommandIfAny();
+                if (ShouldAbortPollingWork()) break;
 
                 if (SendOptaCommand($"READ DI8 CH{ch}", out var diRsp) && TryExtractDigitalState(diRsp, out var diVal))
                 {
@@ -926,7 +950,7 @@ namespace OPTA_ModbusDemo
                 }
             }
 
-            if (SendOptaCommand("READ DI8 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _di8Active = activeVal;
+            if (!ShouldAbortPollingWork() && SendOptaCommand("READ DI8 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _di8Active = activeVal;
             return successCount > 0;
         }
 
@@ -950,78 +974,200 @@ namespace OPTA_ModbusDemo
             response = string.Empty;
             lock (_optaIoSync)
             {
-                try
+                var retriedAfterReconnect = false;
+                while (true)
                 {
-                    if (!_optaConnected || _optaClient == null || _optaStream == null || _optaReader == null || _optaWriter == null)
+                    try
                     {
-                        _lastIoError = _lastDisconnectUtc == DateTime.MinValue
-                            ? "OPTA not connected"
-                            : $"OPTA not connected (last: {_lastDisconnectReason})";
-                        AppendConsoleThreadSafe($"跳過命令 {cmd}：{_lastIoError}", "DIAG");
-                        return false;
-                    }
+                        if (!_optaConnected || _optaClient == null || _optaStream == null || _optaReader == null || _optaWriter == null)
+                        {
+                            var reconnectReason = string.Empty;
+                            var allowAutoReconnect = _pollingEnabled && !_reconnecting;
+                            if (allowAutoReconnect && TryAutoReconnectInsideIoLock(cmd, out reconnectReason))
+                            {
+                                retriedAfterReconnect = true;
+                                AppendConsoleThreadSafe($"自動重連成功，從失敗命令續跑：{cmd}", "DIAG");
+                                continue;
+                            }
 
-                    _lastIoCommand = cmd;
-                    _lastIoKind = cmd.StartsWith("SET", StringComparison.OrdinalIgnoreCase) ? "WRITE" : "READ";
+                            _lastIoError = _lastDisconnectUtc == DateTime.MinValue
+                                ? "OPTA not connected"
+                                : $"OPTA not connected (last: {_lastDisconnectReason})";
+                            if (!string.IsNullOrWhiteSpace(reconnectReason))
+                            {
+                                _lastIoError = $"{_lastIoError} | Reconnect: {reconnectReason}";
+                            }
+                            AppendConsoleThreadSafe($"跳過命令 {cmd}：{_lastIoError}", "DIAG");
+                            return false;
+                        }
 
-                    var elapsedMs = (DateTime.UtcNow - _lastOptaIoUtc).TotalMilliseconds;
-                    if (_lastOptaIoUtc != DateTime.MinValue && elapsedMs < OptaIoIntervalMs)
-                    {
-                        Thread.Sleep(OptaIoIntervalMs - (int)elapsedMs);
-                    }
+                        _lastIoCommand = cmd;
+                        _lastIoKind = cmd.StartsWith("SET", StringComparison.OrdinalIgnoreCase) ? "WRITE" : "READ";
 
-                    _optaWriter.WriteLine(cmd);
-                    var lines = ReadIncomingLines(out var sawTerminator, out var stopReason);
+                        var elapsedMs = (DateTime.UtcNow - _lastOptaIoUtc).TotalMilliseconds;
+                        if (_lastOptaIoUtc != DateTime.MinValue && elapsedMs < OptaIoIntervalMs)
+                        {
+                            Thread.Sleep(OptaIoIntervalMs - (int)elapsedMs);
+                        }
 
-                    response = CollapseResponseForCommand(cmd, lines);
-                    _lastOptaIoUtc = DateTime.UtcNow;
-                    _lastIoKind = "IDLE";
-                    var hasMatchedResponse = !string.IsNullOrWhiteSpace(response);
-                    var hasServerReconnectHint = lines.Any(l => l.Contains("TCP command client connected.", StringComparison.OrdinalIgnoreCase));
-                    var failReason = lines.Count == 0
-                        ? $"Empty response ({stopReason})"
-                        : !sawTerminator
-                            ? $"Packet incomplete ({stopReason})"
-                            : hasMatchedResponse
-                                ? "-"
-                                : "Response mismatch/ERR";
-                    _lastIoError = failReason;
-                    if (hasMatchedResponse && sawTerminator)
-                    {
-                        _optaConnected = true;
-                        _consecutiveIoFailures = 0;
+                        _optaWriter.WriteLine(cmd);
+                        var lines = ReadIncomingLines(out var sawTerminator, out var stopReason);
+
+                        response = CollapseResponseForCommand(cmd, lines);
+                        _lastOptaIoUtc = DateTime.UtcNow;
+                        _lastIoKind = "IDLE";
+                        var hasMatchedResponse = !string.IsNullOrWhiteSpace(response);
+                        var hasServerReconnectHint = lines.Any(l => l.Contains("TCP command client connected.", StringComparison.OrdinalIgnoreCase));
+                        var failReason = lines.Count == 0
+                            ? $"Empty response ({stopReason})"
+                            : !sawTerminator
+                                ? $"Packet incomplete ({stopReason})"
+                                : hasMatchedResponse
+                                    ? "-"
+                                    : "Response mismatch/ERR";
+                        _lastIoError = failReason;
+                        if (hasMatchedResponse && sawTerminator)
+                        {
+                            _optaConnected = true;
+                            _consecutiveIoFailures = 0;
+                            if (hasServerReconnectHint)
+                            {
+                                AppendConsoleThreadSafe($"偵測到伺服器重連提示（命令 {cmd}），可能曾發生短暫斷線。", "DIAG");
+                            }
+                            return true;
+                        }
+
+                        _consecutiveIoFailures++;
+                        AppendConsoleThreadSafe($"I/O 失敗 #{_consecutiveIoFailures}: CMD={cmd} | Stop={stopReason} | Terminator={(sawTerminator ? "Y" : "N")} | Lines={lines.Count} | Best='{response}'", "DIAG");
                         if (hasServerReconnectHint)
                         {
-                            AppendConsoleThreadSafe($"偵測到伺服器重連提示（命令 {cmd}），可能曾發生短暫斷線。", "DIAG");
+                            AppendConsoleThreadSafe("回應中出現 'TCP command client connected.'，研判為裝置端重新接受連線。", "DIAG");
                         }
+
+                        var isTransportDisconnect = !sawTerminator || stopReason.StartsWith("IOException", StringComparison.OrdinalIgnoreCase) || stopReason == "EOF(null)";
+                        var needRecover = isTransportDisconnect || _consecutiveIoFailures >= 3;
+                        if (!needRecover)
+                        {
+                            return false;
+                        }
+
+                        var sample = BuildRawLineSample(lines);
+                        var wasPolling = _pollingEnabled;
+                        DisconnectOpta($"I/O 失敗恢復；命令={cmd}；原因={failReason}；Stop={stopReason}；Sample={sample}", emitLog: true);
+
+                        if (!wasPolling || retriedAfterReconnect)
+                        {
+                            return false;
+                        }
+
+                        if (!TryAutoReconnectInsideIoLock(cmd, out var reconnectFailReason))
+                        {
+                            _lastIoError = $"Auto reconnect failed: {reconnectFailReason}";
+                            return false;
+                        }
+
+                        _pollingEnabled = true;
+                        if (!IsDisposed && IsHandleCreated)
+                        {
+                            BeginInvoke(new Action(() => _btnPollingToggle.Text = "停止輪詢"));
+                        }
+                        retriedAfterReconnect = true;
+                        AppendConsoleThreadSafe($"自動重連成功，重送命令：{cmd}", "DIAG");
+                        continue;
+                    }
+                    catch (Exception ex)
+                    {
+                        _lastOptaIoUtc = DateTime.UtcNow;
+                        _lastIoKind = "ERR";
+                        _lastIoError = ex.Message;
+                        _consecutiveIoFailures++;
+
+                        var wasPolling = _pollingEnabled;
+                        DisconnectOpta($"例外斷線：{ex.GetType().Name} {ex.Message} | CMD={cmd}", emitLog: true);
+
+                        if (wasPolling && !retriedAfterReconnect && TryAutoReconnectInsideIoLock(cmd, out var reconnectReason))
+                        {
+                            _pollingEnabled = true;
+                            if (!IsDisposed && IsHandleCreated)
+                            {
+                                BeginInvoke(new Action(() => _btnPollingToggle.Text = "停止輪詢"));
+                            }
+                            retriedAfterReconnect = true;
+                            AppendConsoleThreadSafe($"例外後自動重連成功，重送命令：{cmd}", "DIAG");
+                            continue;
+                        }
+
+                        UpdateRuntimeStatusUi();
+                        return false;
+                    }
+                }
+            }
+        }
+
+        private bool TryAutoReconnectInsideIoLock(string failedCmd, out string reason)
+        {
+            reason = string.Empty;
+            if (_reconnecting)
+            {
+                reason = "Reconnect already in progress";
+                return false;
+            }
+
+            _reconnecting = true;
+            try
+            {
+                for (var attempt = 1; attempt <= 3; attempt++)
+                {
+                    TcpClient? client = null;
+                    try
+                    {
+                        AppendConsoleThreadSafe($"自動重連中 ({attempt}/3)...", "DIAG");
+                        client = new TcpClient
+                        {
+                            NoDelay = true,
+                            ReceiveTimeout = 1200,
+                            SendTimeout = 1200
+                        };
+
+                        var connectTask = client.ConnectAsync(OptaIp, OptaTcpPort);
+                        if (!connectTask.Wait(1200))
+                        {
+                            reason = $"Connect timeout ({attempt}/3)";
+                            client.Close();
+                            continue;
+                        }
+
+                        _optaClient = client;
+                        _optaStream = client.GetStream();
+                        _optaReader = new StreamReader(_optaStream, Encoding.UTF8, leaveOpen: true);
+                        _optaWriter = new StreamWriter(_optaStream, new UTF8Encoding(false), leaveOpen: true)
+                        {
+                            AutoFlush = true,
+                            NewLine = "\r\n"
+                        };
+
+                        _ = ReadIncomingLines(out _, out _);
+                        _optaConnected = true;
+                        _consecutiveIoFailures = 0;
+                        _lastIoError = "-";
+                        _lastDisconnectReason = "-";
+                        _lastOptaIoUtc = DateTime.UtcNow;
+                        reason = "reconnected";
+                        AppendConsoleThreadSafe($"自動重連成功 ({attempt}/3)，待續跑命令：{failedCmd}", "DIAG");
                         return true;
                     }
-
-                    _consecutiveIoFailures++;
-                    AppendConsoleThreadSafe($"I/O 失敗 #{_consecutiveIoFailures}: CMD={cmd} | Stop={stopReason} | Terminator={(sawTerminator ? "Y" : "N")} | Lines={lines.Count} | Best='{response}'", "DIAG");
-                    if (hasServerReconnectHint)
+                    catch (Exception ex)
                     {
-                        AppendConsoleThreadSafe("回應中出現 'TCP command client connected.'，研判為裝置端重新接受連線。", "DIAG");
+                        reason = ex.Message;
+                        try { client?.Close(); } catch { }
                     }
-
-                    if (_consecutiveIoFailures >= 3)
-                    {
-                        var sample = BuildRawLineSample(lines);
-                        DisconnectOpta($"連續 {_consecutiveIoFailures} 次 I/O 失敗；最後命令={cmd}；原因={failReason}；Stop={stopReason}；Sample={sample}", emitLog: true);
-                    }
-
-                    return false;
                 }
-                catch (Exception ex)
-                {
-                    _lastOptaIoUtc = DateTime.UtcNow;
-                    _lastIoKind = "ERR";
-                    _lastIoError = ex.Message;
-                    _consecutiveIoFailures++;
-                    DisconnectOpta($"例外斷線：{ex.GetType().Name} {ex.Message} | CMD={cmd}", emitLog: true);
-                    UpdateRuntimeStatusUi();
-                    return false;
-                }
+
+                return false;
+            }
+            finally
+            {
+                _reconnecting = false;
             }
         }
 
