@@ -41,8 +41,8 @@ namespace OPTA_ModbusDemo
         private readonly Button[] _dio4DiToggleButtons = new Button[4];
         private readonly Button[] _di8DiToggleButtons = new Button[8];
 
-        private readonly int[] _aiRaw = new int[8];
         private readonly ushort[] _aiType = new ushort[8];
+        private readonly int[] _aiRaw = new int[8];
 
         private readonly bool[] _do8 = new bool[8];
         private int _do8PowerOn;
@@ -85,6 +85,9 @@ namespace OPTA_ModbusDemo
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
         private readonly CancellationTokenSource _pollCts = new();
+        private readonly object _uiRefreshSync = new();
+        private DateTime _lastUiRefreshUtc = DateTime.MinValue;
+        private const int UiRefreshMinIntervalMs = 100;
 
         public Form1()
         {
@@ -114,7 +117,7 @@ namespace OPTA_ModbusDemo
 
                     try
                     {
-                        await Task.Delay(500, _pollCts.Token);
+                        await Task.Delay(250, _pollCts.Token);
                     }
                     catch (TaskCanceledException)
                     {
@@ -204,7 +207,6 @@ namespace OPTA_ModbusDemo
             }
 
             AppendConsole("OPTA connected.", "NET");
-            PrimeAi4TypesOnStartup();
             RefreshAllViews();
 
             UpdateRuntimeStatusUi();
@@ -592,8 +594,8 @@ namespace OPTA_ModbusDemo
         {
             for (var i = 0; i < 8; i++)
             {
-                _aiRaw[i] = 0;
                 _aiType[i] = 0x0103;
+                _aiRaw[i] = 0;
                 _aiValueText[i] = "N/A";
                 _do8[i] = false;
                 _di8[i] = false;
@@ -605,16 +607,6 @@ namespace OPTA_ModbusDemo
                 _dio4Di[i] = false;
                 _dio4Do[i] = false;
                 _dio4Count[i] = 0;
-            }
-        }
-
-        private void PrimeAi4TypesOnStartup()
-        {
-            for (var ch = 0; ch < 8; ch++)
-            {
-                if (!SendOptaCommand($"READ AI4 CH{ch}", out var rsp)) continue;
-                if (TryExtractType(rsp, out var type)) _aiType[ch] = type;
-                if (TryExtractValueText(rsp, out var valueText)) _aiValueText[ch] = valueText;
             }
         }
 
@@ -747,6 +739,28 @@ namespace OPTA_ModbusDemo
             return int.TryParse(token[prefix.Length..], out index) && index >= 0 && index < maxExclusive;
         }
 
+        private void QueueUiRefreshFromBackground(bool force = false)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+
+            lock (_uiRefreshSync)
+            {
+                var elapsedMs = (DateTime.UtcNow - _lastUiRefreshUtc).TotalMilliseconds;
+                if (!force && _lastUiRefreshUtc != DateTime.MinValue && elapsedMs < UiRefreshMinIntervalMs)
+                {
+                    return;
+                }
+
+                _lastUiRefreshUtc = DateTime.UtcNow;
+            }
+
+            BeginInvoke(new Action(() =>
+            {
+                RefreshAllViews();
+                UpdateRuntimeStatusUi();
+            }));
+        }
+
         private async Task TriggerPollAndRefreshAsync()
         {
             if (_pollInFlight) return;
@@ -785,108 +799,119 @@ namespace OPTA_ModbusDemo
         private void PollAllDevices()
         {
             _isAi4Connected = PollAi4();
+            QueueUiRefreshFromBackground(force: true);
+
             _isDo8Connected = PollDo8();
+            QueueUiRefreshFromBackground(force: true);
+
             _isDio4Connected = PollDio4();
+            QueueUiRefreshFromBackground(force: true);
+
             _isDi8Connected = PollDi8();
+            QueueUiRefreshFromBackground(force: true);
         }
 
         private bool PollAi4()
         {
-            var ok = true;
+            var successCount = 0;
             for (var ch = 0; ch < 8; ch++)
             {
                 ProcessPendingSetCommandIfAny();
 
                 if (!SendOptaCommand($"READ AI4 CH{ch}", out var valRsp))
                 {
-                    ok = false;
                     continue;
                 }
 
+                successCount++;
                 _aiValueText[ch] = TryExtractValueText(valRsp, out var valueText) ? valueText : valRsp;
                 if (TryExtractType(valRsp, out var type)) _aiType[ch] = type;
-
-                if (SendOptaCommand($"READ AI4 RAW CH{ch}", out var rawRsp) && TryExtractLastInt(rawRsp, out var raw))
-                {
-                    _aiRaw[ch] = raw;
-                }
-                else
-                {
-                    ok = false;
-                }
+                if (TryExtractAiRaw(valRsp, out var raw)) _aiRaw[ch] = raw;
+                QueueUiRefreshFromBackground();
             }
 
-            return ok;
+            return successCount > 0;
         }
 
         private bool PollDo8()
         {
-            var ok = true;
+            var successCount = 0;
             for (var ch = 0; ch < 8; ch++)
             {
                 ProcessPendingSetCommandIfAny();
 
                 if (!SendOptaCommand($"READ DO8 CH{ch}", out var rsp))
                 {
-                    ok = false;
                     continue;
                 }
 
+                successCount++;
                 if (TryExtractOnOff(rsp, out var isOn)) _do8[ch] = isOn;
+                QueueUiRefreshFromBackground();
             }
 
             if (SendOptaCommand("READ DO8 POWERON", out var powerRsp) && TryExtractLastInt(powerRsp, out var powerVal)) _do8PowerOn = powerVal;
             if (SendOptaCommand("READ DO8 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _do8Active = activeVal;
-            return ok;
+            return successCount > 0;
         }
 
         private bool PollDio4()
         {
-            var ok = true;
+            var successCount = 0;
             for (var ch = 0; ch < 4; ch++)
             {
                 ProcessPendingSetCommandIfAny();
 
-                if (SendOptaCommand($"READ DIO4 DI{ch}", out var diRsp) && TryExtractLastInt(diRsp, out var diVal))
-                    _dio4Di[ch] = diVal != 0;
-                else
-                    ok = false;
+                if (SendOptaCommand($"READ DIO4 DI{ch}", out var diRsp) && TryExtractDigitalState(diRsp, out var diVal))
+                {
+                    _dio4Di[ch] = diVal;
+                    successCount++;
+                    QueueUiRefreshFromBackground();
+                }
 
                 if (SendOptaCommand($"READ DIO4 COUNT CH{ch}", out var cntRsp) && TryExtractLastInt(cntRsp, out var cntVal))
+                {
                     _dio4Count[ch] = cntVal;
-                else
-                    ok = false;
+                    successCount++;
+                    QueueUiRefreshFromBackground();
+                }
 
                 if (SendOptaCommand($"READ DIO4 DO{ch}", out var doRsp) && TryExtractOnOff(doRsp, out var doVal))
+                {
                     _dio4Do[ch] = doVal;
-                else
-                    ok = false;
+                    successCount++;
+                    QueueUiRefreshFromBackground();
+                }
             }
 
             if (SendOptaCommand("READ DIO4 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _dio4Active = activeVal;
-            return ok;
+            return successCount > 0;
         }
 
         private bool PollDi8()
         {
-            var ok = true;
+            var successCount = 0;
             for (var ch = 0; ch < 8; ch++)
             {
                 ProcessPendingSetCommandIfAny();
 
-                if (SendOptaCommand($"READ DI8 CH{ch}", out var diRsp) && TryExtractLastInt(diRsp, out var diVal))
-                    _di8[ch] = diVal != 0;
-                else
-                    ok = false;
+                if (SendOptaCommand($"READ DI8 CH{ch}", out var diRsp) && TryExtractDigitalState(diRsp, out var diVal))
+                {
+                    _di8[ch] = diVal;
+                    successCount++;
+                    QueueUiRefreshFromBackground();
+                }
 
                 if (SendOptaCommand($"READ DI8 COUNT CH{ch}", out var cntRsp) && TryExtractLastInt(cntRsp, out var cntVal))
+                {
                     _di8Count[ch] = cntVal;
-                else
-                    ok = false;
+                    successCount++;
+                    QueueUiRefreshFromBackground();
+                }
             }
 
             if (SendOptaCommand("READ DI8 ACTIVE", out var activeRsp) && TryExtractLastInt(activeRsp, out var activeVal)) _di8Active = activeVal;
-            return ok;
+            return successCount > 0;
         }
 
         private void UpdateStateFromResponse(string command, string response)
@@ -971,6 +996,13 @@ namespace OPTA_ModbusDemo
 
                 var line = _optaReader.ReadLine();
                 if (line == null) break;
+
+                var trimmed = line.Trim();
+                if (trimmed.Equals("<br>", StringComparison.OrdinalIgnoreCase) || trimmed.Equals("<br/>", StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+
                 lines.Add(line);
                 idleWait.Restart();
             }
@@ -988,9 +1020,15 @@ namespace OPTA_ModbusDemo
                 .Where(l => !l.StartsWith("Connected to", StringComparison.OrdinalIgnoreCase))
                 .Where(l => !l.StartsWith("Type HELP", StringComparison.OrdinalIgnoreCase))
                 .Where(l => !l.StartsWith(">", StringComparison.OrdinalIgnoreCase))
+                .Where(l => !l.Equals("<br>", StringComparison.OrdinalIgnoreCase))
+                .Where(l => !l.Equals("<br/>", StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
-            if (sanitized.Count == 0) sanitized = lines;
+            if (sanitized.Count == 0)
+            {
+                sanitized = lines.Select(l => l.Trim()).Where(l => !string.IsNullOrWhiteSpace(l)).ToList();
+                if (sanitized.Count == 0) return string.Empty;
+            }
 
             var upper = cmd.ToUpperInvariant();
             if (upper == "HELP" || upper == "READ AI4 ALL")
@@ -998,7 +1036,76 @@ namespace OPTA_ModbusDemo
                 return string.Join('\n', sanitized);
             }
 
-            return sanitized[^1];
+            var terminals = sanitized
+                .Select((line, idx) => new { line, idx })
+                .Where(x => x.line.StartsWith("OK", StringComparison.OrdinalIgnoreCase)
+                         || x.line.StartsWith("ERR", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (terminals.Count == 0)
+            {
+                return sanitized[^1];
+            }
+
+            var expected = BuildExpectedResponseHints(cmd);
+            var best = terminals
+                .Select(x => new
+                {
+                    x.line,
+                    x.idx,
+                    score = ScoreResponseLine(x.line, expected)
+                })
+                .OrderByDescending(x => x.score)
+                .ThenByDescending(x => x.idx)
+                .First();
+
+            return best.line;
+        }
+
+        private static string[] BuildExpectedResponseHints(string cmd)
+        {
+            var p = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(t => t.ToUpperInvariant())
+                .ToArray();
+
+            var hints = new List<string>();
+            if (p.Length > 1) hints.Add(p[1]); // AI4 / DO8 / DIO4 / DI8
+
+            for (var i = 2; i < p.Length; i++)
+            {
+                var token = p[i];
+                if (token.StartsWith("CH") && token.Length > 2)
+                {
+                    hints.Add(token);
+                    continue;
+                }
+
+                if ((token.StartsWith("DI") || token.StartsWith("DO")) && token.Length > 2 && int.TryParse(token[2..], out var chIndex))
+                {
+                    hints.Add($"CH{chIndex}");
+                    continue;
+                }
+
+                if (token is "ACTIVE" or "POWERON" or "TYPE" or "RAW" or "ALL")
+                {
+                    hints.Add(token);
+                }
+            }
+
+            return hints.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+
+        private static int ScoreResponseLine(string line, string[] hints)
+        {
+            var score = 0;
+            foreach (var hint in hints)
+            {
+                if (line.Contains(hint, StringComparison.OrdinalIgnoreCase)) score += 10;
+            }
+
+            if (line.StartsWith("OK", StringComparison.OrdinalIgnoreCase)) score += 2;
+            if (line.StartsWith("ERR", StringComparison.OrdinalIgnoreCase)) score += 1;
+            return score;
         }
 
         private static (int totalTimeoutMs, int idleGapMs) GetResponseTiming(string cmd)
@@ -1007,20 +1114,20 @@ namespace OPTA_ModbusDemo
 
             if (upper == "HELP")
             {
-                return (4000, 120);
+                return (5000, 250);
             }
 
             if (upper == "READ AI4 ALL")
             {
-                return (3000, 120);
+                return (3500, 180);
             }
 
-            return (1200, 25);
+            return (1500, 60);
         }
 
         private static bool TryExtractType(string text, out ushort type)
         {
-            var m = Regex.Match(text, @"0x([0-9A-Fa-f]{4})");
+            var m = Regex.Match(text, @"0[xX]([0-9A-Fa-f]{1,4})");
             if (!m.Success)
             {
                 type = 0;
@@ -1028,6 +1135,33 @@ namespace OPTA_ModbusDemo
             }
 
             return ushort.TryParse(m.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out type);
+        }
+
+        private static bool TryExtractAiRaw(string text, out int raw)
+        {
+            var m = Regex.Match(text, @"RAW\s*=\s*(-?\d+)", RegexOptions.IgnoreCase);
+            if (!m.Success)
+            {
+                raw = 0;
+                return false;
+            }
+
+            return int.TryParse(m.Groups[1].Value, out raw);
+        }
+
+        private static bool TryExtractDigitalState(string text, out bool on)
+        {
+            if (TryExtractOnOff(text, out on)) return true;
+
+            var m = Regex.Match(text, @"(?:=|\b)([01])\b\s*$", RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                on = m.Groups[1].Value == "1";
+                return true;
+            }
+
+            on = false;
+            return false;
         }
 
         private static bool TryExtractLastInt(string text, out int value)
