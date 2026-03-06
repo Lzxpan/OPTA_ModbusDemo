@@ -81,6 +81,7 @@ namespace OPTA_ModbusDemo
         private string _lastIoError = "-";
         private bool _optaConnected;
         private bool _pollingEnabled;
+        private int _consecutiveIoFailures;
 
         private readonly SemaphoreSlim _pollLock = new(1, 1);
         private bool _pollInFlight;
@@ -174,6 +175,7 @@ namespace OPTA_ModbusDemo
                     {
                         _lastIoError = "Connect timeout";
                         _optaConnected = false;
+                        client.Close();
                     }
                     else
                     {
@@ -224,6 +226,7 @@ namespace OPTA_ModbusDemo
             _optaStream = null;
             _optaClient = null;
             _optaConnected = false;
+            _consecutiveIoFailures = 0;
             while (_pendingSetCommands.TryDequeue(out _)) { }
         }
 
@@ -958,15 +961,29 @@ namespace OPTA_ModbusDemo
                     response = CollapseResponseForCommand(cmd, lines);
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "IDLE";
-                    _lastIoError = lines.Count == 0 ? "Empty response" : "-";
-                    _optaConnected = true;
-                    return lines.Count > 0;
+                    var hasMatchedResponse = !string.IsNullOrWhiteSpace(response);
+                    _lastIoError = lines.Count == 0 ? "Empty response" : (hasMatchedResponse ? "-" : "Response mismatch");
+                    _optaConnected = hasMatchedResponse;
+                    if (hasMatchedResponse)
+                    {
+                        _consecutiveIoFailures = 0;
+                        return true;
+                    }
+
+                    _consecutiveIoFailures++;
+                    if (_consecutiveIoFailures >= 3)
+                    {
+                        DisconnectOpta();
+                    }
+
+                    return false;
                 }
                 catch (Exception ex)
                 {
                     _lastOptaIoUtc = DateTime.UtcNow;
                     _lastIoKind = "ERR";
                     _lastIoError = ex.Message;
+                    _consecutiveIoFailures++;
                     DisconnectOpta();
                     UpdateRuntimeStatusUi();
                     return false;
@@ -1055,9 +1072,15 @@ namespace OPTA_ModbusDemo
                     x.idx,
                     score = ScoreResponseLine(x.line, expected)
                 })
+                .Where(x => x.score > 0)
                 .OrderByDescending(x => x.score)
                 .ThenByDescending(x => x.idx)
-                .First();
+                .FirstOrDefault();
+
+            if (best == null)
+            {
+                return string.Empty;
+            }
 
             return best.line;
         }
@@ -1097,6 +1120,26 @@ namespace OPTA_ModbusDemo
 
         private static int ScoreResponseLine(string line, string[] hints)
         {
+            if (!TryGetCommandSignature(hints, out var deviceHint, out var chHint, out var keywordHint))
+            {
+                return 0;
+            }
+
+            if (!line.Contains(deviceHint, StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+
+            if (!string.IsNullOrEmpty(chHint) && !LineContainsChannel(line, chHint))
+            {
+                return 0;
+            }
+
+            if (!string.IsNullOrEmpty(keywordHint) && !line.Contains(keywordHint, StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+
             var score = 0;
             foreach (var hint in hints)
             {
@@ -1106,6 +1149,25 @@ namespace OPTA_ModbusDemo
             if (line.StartsWith("OK", StringComparison.OrdinalIgnoreCase)) score += 2;
             if (line.StartsWith("ERR", StringComparison.OrdinalIgnoreCase)) score += 1;
             return score;
+        }
+
+        private static bool TryGetCommandSignature(string[] hints, out string deviceHint, out string chHint, out string keywordHint)
+        {
+            deviceHint = hints.FirstOrDefault(h => h is "AI4" or "DO8" or "DIO4" or "DI8") ?? string.Empty;
+            chHint = hints.FirstOrDefault(h => h.StartsWith("CH", StringComparison.OrdinalIgnoreCase)) ?? string.Empty;
+            keywordHint = hints.FirstOrDefault(h => h is "ACTIVE" or "POWERON" or "TYPE" or "RAW") ?? string.Empty;
+            return !string.IsNullOrWhiteSpace(deviceHint);
+        }
+
+        private static bool LineContainsChannel(string line, string chHint)
+        {
+            if (line.Contains(chHint, StringComparison.OrdinalIgnoreCase)) return true;
+
+            if (!int.TryParse(chHint[2..], out var index)) return false;
+
+            return line.Contains($"DI{index}", StringComparison.OrdinalIgnoreCase)
+                || line.Contains($"DO{index}", StringComparison.OrdinalIgnoreCase)
+                || line.Contains($"AI{index}", StringComparison.OrdinalIgnoreCase);
         }
 
         private static (int totalTimeoutMs, int idleGapMs) GetResponseTiming(string cmd)
