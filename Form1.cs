@@ -66,7 +66,9 @@ namespace OPTA_ModbusDemo
         private const string OptaIp = "192.168.2.100";
 
         private const int OptaTcpPort = 5000;
-        private const int OptaIoIntervalMs = 250;
+        private const int OptaIoIntervalMs = 100;
+        private const int PollLoopIntervalMs = 100;
+        private const int OptaSocketTimeoutMs = 3000;
         private readonly object _optaIoSync = new();
         private TcpClient? _optaClient;
         private NetworkStream? _optaStream;
@@ -120,7 +122,7 @@ namespace OPTA_ModbusDemo
 
                     try
                     {
-                        await Task.Delay(250, _pollCts.Token);
+                        await Task.Delay(PollLoopIntervalMs, _pollCts.Token);
                     }
                     catch (TaskCanceledException)
                     {
@@ -169,11 +171,11 @@ namespace OPTA_ModbusDemo
                     var client = new TcpClient
                     {
                         NoDelay = true,
-                        ReceiveTimeout = 1200,
-                        SendTimeout = 1200
+                        ReceiveTimeout = OptaSocketTimeoutMs,
+                        SendTimeout = OptaSocketTimeoutMs
                     };
                     var connectTask = client.ConnectAsync(OptaIp, OptaTcpPort);
-                    if (!connectTask.Wait(1200))
+                    if (!connectTask.Wait(OptaSocketTimeoutMs))
                     {
                         _lastIoError = "Connect timeout";
                         _optaConnected = false;
@@ -793,7 +795,8 @@ namespace OPTA_ModbusDemo
                 await _pollLock.WaitAsync();
                 try
                 {
-                    await Task.Run(PollAllDevices);
+                    var selectedDevice = GetSelectedDeviceForPolling();
+                    await Task.Run(() => PollSelectedDevice(selectedDevice));
                 }
                 finally
                 {
@@ -819,23 +822,41 @@ namespace OPTA_ModbusDemo
             }
         }
 
-        private void PollAllDevices()
+        private string GetSelectedDeviceForPolling()
+        {
+            if (IsDisposed) return "AI4";
+            if (InvokeRequired)
+            {
+                return (string)Invoke(new Func<string>(GetSelectedDeviceForPolling));
+            }
+
+            var tabText = _tabDevices.SelectedTab?.Text?.Trim().ToUpperInvariant();
+            return tabText is "AI4" or "DO8" or "DIO4" or "DI8" ? tabText : "AI4";
+        }
+
+        private void PollSelectedDevice(string device)
         {
             if (ShouldAbortPollingWork()) return;
 
-            _isAi4Connected = PollAi4();
-            QueueUiRefreshFromBackground(force: true);
-            if (ShouldAbortPollingWork()) return;
+            switch (device)
+            {
+                case "AI4":
+                    _isAi4Connected = PollAi4();
+                    break;
+                case "DO8":
+                    _isDo8Connected = PollDo8();
+                    break;
+                case "DIO4":
+                    _isDio4Connected = PollDio4();
+                    break;
+                case "DI8":
+                    _isDi8Connected = PollDi8();
+                    break;
+                default:
+                    _isAi4Connected = PollAi4();
+                    break;
+            }
 
-            _isDo8Connected = PollDo8();
-            QueueUiRefreshFromBackground(force: true);
-            if (ShouldAbortPollingWork()) return;
-
-            _isDio4Connected = PollDio4();
-            QueueUiRefreshFromBackground(force: true);
-            if (ShouldAbortPollingWork()) return;
-
-            _isDi8Connected = PollDi8();
             QueueUiRefreshFromBackground(force: true);
         }
 
@@ -1125,12 +1146,12 @@ namespace OPTA_ModbusDemo
                         client = new TcpClient
                         {
                             NoDelay = true,
-                            ReceiveTimeout = 1200,
-                            SendTimeout = 1200
+                            ReceiveTimeout = OptaSocketTimeoutMs,
+                            SendTimeout = OptaSocketTimeoutMs
                         };
 
                         var connectTask = client.ConnectAsync(OptaIp, OptaTcpPort);
-                        if (!connectTask.Wait(1200))
+                        if (!connectTask.Wait(OptaSocketTimeoutMs))
                         {
                             reason = $"Connect timeout ({attempt}/3)";
                             client.Close();
