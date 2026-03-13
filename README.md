@@ -1,5 +1,9 @@
 # Opta TCP/IP Multi-Device Demo (WinForms)
 
+## 0. 介面圖片（`images/`）
+
+![OPTA_Pinder_Demo](images/OPTA_Pinder_Demo.jpg)
+
 本專案是 WinForms DEMO，**只透過 TCP/IP 與 Opta (`192.168.2.100:5000`) 溝通**，由 Opta 端去處理 Modbus。
 
 > 本程式不直接連任何 Modbus 裝置（不使用 port 502）。
